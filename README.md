@@ -1,7 +1,5 @@
 # DIGER: Differentiable Semantic ID for Generative Recommendation
 
-A minimal, clean implementation for anonymous review.
-
 ## Overview
 
 This repository contains the core implementation of our recommendation model with two training strategies:
