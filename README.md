@@ -36,8 +36,8 @@ pip install torch transformers accelerate pyyaml numpy faiss-cpu scikit-learn co
 ```
 
 ### Python Version
-- Python 3.8+
-- PyTorch 1.10+
+- Python 3.12.11
+- PyTorch 2.5.1
 
 ## Data Preparation
 
@@ -84,28 +84,6 @@ Before running, update the placeholder paths in the following files:
    data_path: ./dataset  # Update if needed
    ```
 
-### Key Configuration Parameters
-
-#### Model Architecture
-- `code_num`: 256 (codebook size)
-- `code_length`: 4 (number of RQ layers + 1)
-- `e_dim`: 256 (embedding dimension)
-- `d_model`: 128 (transformer hidden size)
-- `encoder_layers`: 6
-- `decoder_layers`: 6
-
-#### Training
-- `epochs`: 200 (with early stopping)
-- `early_stop`: 15
-- `batch_size`: 256
-- `lr_rec`: 0.005 (recommender learning rate)
-- `lr_id`: 0.0005 (tokenizer learning rate)
-
-#### Loss Weights
-- `code_loss_weight`: 1.0
-- `recon_loss_weight`: 1.0
-- `vq_loss_weight`: 1.0
-
 ## Usage
 
 ### Training Script 1: Adaptive Popularity-based Selection
@@ -116,12 +94,6 @@ This script uses adaptive selection to dynamically choose between Gumbel samplin
 bash run_beauty_adaptive_popularity.sh
 ```
 
-**Key parameters:**
-- `use_adaptive_selection=true`: Enable adaptive selection
-- `hot_threshold_ratio=1.5`: Threshold for determining hot codes
-- `usage_momentum=0.99`: EMA momentum for code usage tracking
-- `gumbel_tau=2`: Temperature for Gumbel-Softmax
-
 ### Training Script 2: Simple Uncertainty Loss
 
 This script uses a learnable uncertainty parameter to automatically balance task loss.
@@ -129,13 +101,6 @@ This script uses a learnable uncertainty parameter to automatically balance task
 ```bash
 bash run_beauty_simple_sigma.sh
 ```
-
-**Key parameters:**
-- `use_learnable_sigma_gumbel=true`: Enable learnable uncertainty
-- `use_simple_uncertainty_loss=true`: Use simple uncertainty formulation
-- `sigma_lambda=1.7`: Lambda bias term
-- `initial_std=1.0`: Initial standard deviation
-- `lr_sigma=1e-3`: Learning rate for sigma
 
 **Loss formula:**
 ```
