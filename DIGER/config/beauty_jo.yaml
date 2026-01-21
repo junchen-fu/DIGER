@@ -1,0 +1,88 @@
+dataset: beauty
+seed: 2020
+reproducibility: True
+log_dir: ./logs
+
+map_path: .emb_map.json
+semantic_emb_path: <PATH_TO_DATASET>/beauty/Beauty.emb-llama.npy
+semantic_hidden_size: 4096
+code_num: 256
+code_length: 4
+
+# train
+epochs: 500
+lr_rec: 0.005
+weight_decay: 0.05
+
+# Joint optimization training configuration (follow scientific settings)
+joint_optimization: True  # Enable joint optimization training with Gumbel-Softmax
+freeze_semantic_embedding: true
+use_indicator_ste: true
+freeze_id_epochs: 0
+
+# Stable training key parameters
+lr_id: 0.0005
+gumbel_tau: 2.0
+
+# Loss weights for joint optimization training
+code_loss_weight: 1.0
+recon_loss_weight: 1.0
+vq_loss_weight: 1.0
+
+# Loss computation parameters
+sim: cos
+alpha: 1
+tau: 0.07
+loss_type: mse
+
+warmup_steps: 500
+batch_size: 256
+eval_batch_size: 32
+num_workers: 8
+eval_step: 1
+learner: AdamW
+data_path: ./dataset
+lr_scheduler_type: cosine
+gradient_accumulation_steps: 1
+
+max_his_len: 50
+early_stop: 15
+
+metrics: recall@1,recall@5,ndcg@5,recall@10,ndcg@10
+valid_metric: ndcg@10
+
+# model
+max_length: 210
+encoder_layers: 6
+decoder_layers: 6
+d_model: 128
+d_ff: 512
+num_heads: 4
+d_kv: 64
+dropout_rate: 0.1
+activation_function: "relu"
+feed_forward_proj: "relu"
+num_beams: 20
+
+# RQ-VAE checkpoint path (pre-trained, will be fine-tuned in joint optimization mode)
+rqvae_path: <PATH_TO_RQVAE_CHECKPOINT>
+
+# RQ-VAE architecture
+num_emb_list: [256,256,256]
+beta: 0.25
+e_dim: 256
+layers: [2048,1024,512]
+vq_type: vq
+dist: l2
+alpha: 1
+loss_type: mse
+tau: 0.07
+kmeans_init: False
+kmeans_iters: 100
+dropout_prob: 0.0
+bn: False
+sk_epsilons: [0.003, 0.003, 0.003]
+sk_iters: 50
+
+
+
