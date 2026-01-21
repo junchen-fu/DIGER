@@ -1,4 +1,4 @@
-# DIGER: Discrete Item Generation for Recommendation
+# DIGER: Differentiable Semantic ID for Generative Recommendation
 
 A minimal, clean implementation for anonymous review.
 
