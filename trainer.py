@@ -455,7 +455,7 @@ class Trainer(object):
                                 else:
                                     self.log(f"[Plain Loss] sigma={sigma_val:.4f}, std≈{2**sigma_val:.4f}, code_loss={code_loss.item():.4f}")
                         elif use_simple_uncertainty_loss:
-                            # NEW: Simple Uncertainty Loss with optional learnable/adaptive lambda
+                            # NEW: Standard Deviation Uncertainty Decay (SDUD) with optional learnable/adaptive lambda
                             original_code_loss = code_loss.item()
                             sigma_lambda = self.config.get('sigma_lambda', 0.5)
                             
@@ -487,15 +487,15 @@ class Trainer(object):
                                 # Check auto_lambda_mode
                                 auto_lambda_mode = self.config.get('auto_lambda_mode', 'fixed')
                                 if auto_lambda_mode == 'learnable':
-                                    self.log(f"[Simple Uncertainty] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (learnable), Target_sigma={target_sigma:.4f}")
+                                    self.log(f"[SDUD] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (learnable), Target_sigma={target_sigma:.4f}")
                                 elif auto_lambda_mode == 'adaptive':
                                     if auto_sigma_module is not None:
                                         loss_ema = auto_sigma_module.loss_ema.item()
-                                        self.log(f"[Simple Uncertainty] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (adaptive, EMA={loss_ema:.4f}), Target_sigma={target_sigma:.4f}")
+                                        self.log(f"[SDUD] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (adaptive, EMA={loss_ema:.4f}), Target_sigma={target_sigma:.4f}")
                                     else:
-                                        self.log(f"[Simple Uncertainty] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (adaptive), Target_sigma={target_sigma:.4f}")
+                                        self.log(f"[SDUD] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (adaptive), Target_sigma={target_sigma:.4f}")
                                 else:
-                                    self.log(f"[Simple Uncertainty] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (fixed), Target_sigma={target_sigma:.4f}")
+                                    self.log(f"[SDUD] sigma={sigma_val:.4f}, Loss={original_code_loss:.4f}, λ={lambda_val:.4f} (fixed), Target_sigma={target_sigma:.4f}")
                         else:
                             # Use uncertainty-weighted loss (default)
                             original_code_loss = code_loss.item()  # Save for logging

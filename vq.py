@@ -295,11 +295,11 @@ class AutoSigmaGumbel(nn.Module):
 
 class AutoSigmaSimple(nn.Module):
     """
-    New Simple Learnable Sigma Module (User Request).
+    Standard Deviation Uncertainty Decay (SDUD) Module.
     
     Key Differences from AutoSigmaGumbel:
     1. Sigma is directly the std (or noise scale), no 2^x conversion.
-    2. Uses simple uncertainty loss: L = L / (2(s+lambda)^2) + log(s+lambda).
+    2. Uses SDUD loss: L = L / (2(s+lambda)^2) + log(s+lambda).
     
     Learnable Lambda Options:
     - auto_lambda_mode='fixed': Use fixed sigma_lambda (default, backward compatible)

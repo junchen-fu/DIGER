@@ -51,7 +51,7 @@ accelerate launch --config_file ${ACCEL_CFG} main.py \
     --use_gate_network=false \
     --use_simple_uncertainty_loss=true \
     --sigma_lambda=1.7 \
-    --usage_dir_suffix=simple_uncertainty_17
+    --usage_dir_suffix=sdud_17
 
 echo ""
 echo "========================================================================"

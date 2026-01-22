@@ -3,8 +3,8 @@
 ## Overview
 
 This repository contains the core implementation of our recommendation model with two training strategies:
-1. **Adaptive Popularity-based Selection**: Dynamically switches between Gumbel sampling and deterministic indexing based on code usage frequency
-2. **Simple Uncertainty Loss**: Uses learnable uncertainty to balance task loss
+1. **Frequency-based Uncertainty Decay**: Dynamically switches between Gumbel sampling and deterministic indexing based on code usage frequency
+2. **Standard Deviation Uncertainty Decay**: Uses learnable uncertainty to balance task loss
 
 ## Repository Structure
 
@@ -21,8 +21,8 @@ DIGER/
 ├── config/
 │   └── beauty_jo.yaml                  # Configuration file for Beauty dataset
 ├── accelerate_config.yaml              # Accelerate configuration
-├── run_beauty_adaptive_popularity.sh   # Training script 1
-└── run_beauty_simple_sigma.sh          # Training script 2
+├── run_FrqUD.sh                        # Training script 1
+└── run_SDUD.sh                         # Training script 2
 ```
 
 ## Requirements
@@ -70,7 +70,7 @@ You need a pre-trained RQ-VAE checkpoint. The checkpoint should contain:
 
 Before running, update the placeholder paths in the following files:
 
-1. **Shell scripts** (`run_beauty_adaptive_popularity.sh`, `run_beauty_simple_sigma.sh`):
+1. **Shell scripts** (`run_FrqUD.sh`, `run_SDUD.sh`):
    ```bash
    RQVAE_INIT="<PATH_TO_RQVAE_CHECKPOINT>"  # Update this
    ```
@@ -84,20 +84,20 @@ Before running, update the placeholder paths in the following files:
 
 ## Usage
 
-### Training Script 1: Adaptive Popularity-based Selection
+### Training Script 1: Frequency-based Uncertainty Decay
 
 This script uses adaptive selection to dynamically choose between Gumbel sampling (for popular codes) and deterministic indexing (for rare codes).
 
 ```bash
-bash run_beauty_adaptive_popularity.sh
+bash run_FrqUD.sh
 ```
 
-### Training Script 2: Simple Uncertainty Loss
+### Training Script 2: Standard Deviation Uncertainty Decay
 
 This script uses a learnable uncertainty parameter to automatically balance task loss.
 
 ```bash
-bash run_beauty_simple_sigma.sh
+bash run_SDUD.sh
 ```
 
 **Loss formula:**
@@ -106,23 +106,6 @@ L = L_task / (2*(σ+λ)²) + log(σ+λ)
 ```
 
 At equilibrium: `σ = sqrt(L_task) - λ`
-
-## Accelerate Configuration
-
-The repository includes a minimal single-GPU configuration (`accelerate_config.yaml`). 
-
-For multi-GPU training, modify the config:
-
-```yaml
-distributed_type: 'MULTI_GPU'
-num_processes: 4  # Number of GPUs
-```
-
-Or use accelerate's config wizard:
-
-```bash
-accelerate config
-```
 
 ## Output
 
@@ -139,7 +122,8 @@ Model checkpoints are saved to `./myckpt/<dataset>/` including:
 ### Metrics
 
 The model is evaluated on:
-- Recall@1, Recall@5, Recall@10
+
+-  Recall@5, Recall@10
 - NDCG@5, NDCG@10
 
 Validation metric: NDCG@10
