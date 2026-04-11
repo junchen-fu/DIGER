@@ -242,18 +242,18 @@ class AutoSigmaGumbel(nn.Module):
                 => sigma = a * ln(L_task) + b
         
         SLOW-THEN-FAST Piecewise Annealing (configurable):
-            采用分段策略实现"先慢后快"的退火
-            
+            Piecewise schedule: slow phase first, then fast phase.
+
             Default (Beauty dataset):
-            阶段1 (慢速): L ∈ [2.2, 5.0] → sigma ∈ [-1, 1]
-            - L=5.0  → sigma=1 (std=2, 温和初始探索)
-            - L=2.2  → sigma=-1 (std=0.5, 切换点)
-            - k=0.458, c=1.361 (慢速退火)
-            
-            阶段2 (快速): L ∈ [1.6, 2.2] → sigma ∈ [-20, -1]
-            - L=2.2  → sigma=-1 (std=0.5, 切换点)
-            - L=1.6  → sigma=-20 (std≈0, 更快收敛)
-            - k=0.018, c=0.037 (快速退火)
+            Phase 1 (slow): L ∈ [2.2, 5.0] → sigma ∈ [-1, 1]
+            - L=5.0  → sigma=1 (std=2, mild initial exploration)
+            - L=2.2  → sigma=-1 (std=0.5, handoff point)
+            - k=0.458, c=1.361 (slow annealing)
+
+            Phase 2 (fast): L ∈ [1.6, 2.2] → sigma ∈ [-20, -1]
+            - L=2.2  → sigma=-1 (std=0.5, handoff point)
+            - L=1.6  → sigma=-20 (std≈0, faster convergence)
+            - k=0.018, c=0.037 (fast annealing)
             
             Instruments dataset (configurable):
             - Threshold: 2.5 (vs 2.2 for beauty)
@@ -571,11 +571,11 @@ class RQVAE(nn.Module):
         return self.rq.get_codebook()
     
     def get_adaptive_selection_stats(self):
-        """获取自适应选择的统计信息"""
+        """Return statistics for adaptive Gumbel vs. deterministic selection."""
         return self.rq.get_adaptive_selection_stats()
     
     def reset_adaptive_selection_stats(self):
-        """重置自适应选择的统计信息"""
+        """Reset adaptive selection counters."""
         self.rq.reset_adaptive_selection_stats()
     
 
@@ -609,7 +609,7 @@ class ResidualVectorQuantizer(nn.Module):
         return torch.stack(all_codebook)
     
     def get_adaptive_selection_stats(self):
-        """获取所有quantizer的自适应选择统计信息"""
+        """Aggregate adaptive selection stats across all quantizer layers."""
         total_gumbel = 0
         total_deterministic = 0
         stats_per_layer = []
@@ -665,7 +665,7 @@ class ResidualVectorQuantizer(nn.Module):
         return result
     
     def reset_adaptive_selection_stats(self):
-        """重置所有quantizer的自适应选择统计信息"""
+        """Reset adaptive selection counters on every quantizer layer."""
         for quantizer in self.vq_layers:
             quantizer.reset_adaptive_selection_stats()
 
@@ -876,7 +876,7 @@ class VectorQuantizer(nn.Module):
         return z_q
     
     def get_adaptive_selection_stats(self):
-        """获取自适应选择的统计信息"""
+        """Return statistics for adaptive Gumbel vs. deterministic selection."""
         if not hasattr(self, '_gumbel_count'):
             stats = {'gumbel_count': 0, 'deterministic_count': 0, 'total_count': 0, 
                     'gumbel_ratio': 0.0, 'deterministic_ratio': 0.0}
@@ -916,7 +916,7 @@ class VectorQuantizer(nn.Module):
         return stats
     
     def reset_adaptive_selection_stats(self):
-        """重置自适应选择的统计信息"""
+        """Reset adaptive selection counters."""
         self._gumbel_count = 0
         self._deterministic_count = 0
         self._gate_reg_loss_sum = 0.0
@@ -924,14 +924,15 @@ class VectorQuantizer(nn.Module):
     
     def get_sequence_level_decision(self, x):
         """
-        在RQ序列级别统一决定每个样本是用Gumbel还是确定性。
-        这个方法只在第一层quantizer上调用，决策应用于所有层。
-        
+        Decide per sample whether to use Gumbel or deterministic quantization at the
+        full RQ stack level. Call only on the first quantizer; the same decision
+        applies to all subsequent layers.
+
         Args:
             x: Input tensor [B, D]
-        
+
         Returns:
-            sample_use_gumbel_mask: [B] boolean tensor, True表示该样本用Gumbel
+            sample_use_gumbel_mask: [B] bool tensor; True means use Gumbel for that sample.
         """
         if not self.use_adaptive_selection:
             return None
@@ -981,11 +982,11 @@ class VectorQuantizer(nn.Module):
         Soft-Threshold Operation: S(freq, α) = ReLU(freq - α)
         
         Args:
-            frequencies: code使用频率 [K]
-        
+            frequencies: Per-code usage frequencies, shape [K].
+
         Returns:
-            activity_scores: 活跃度分数 [K]，> 0 表示活跃码，= 0 表示死码
-            threshold: 当前使用的阈值标量
+            activity_scores: Activity scores [K]; > 0 = active code, 0 = dead code.
+            threshold: Scalar threshold in use.
         """
         if not self.use_soft_frequency or self.dead_code_threshold_logit is None:
             avg_freq = 1.0 / self.n_e
@@ -1035,8 +1036,8 @@ class VectorQuantizer(nn.Module):
                               If False, use vector-level STE (legacy)
             use_gumbel_sampling: If True, sample indices from Gumbel-Softmax (stochastic);
                                 If False, use deterministic argmin (default behavior)
-            sample_use_gumbel_mask: [B] boolean tensor, 序列级别的统一决策。
-                                   如果提供，则使用这个mask而不是重新计算（用于RQ序列一致性）
+            sample_use_gumbel_mask: Optional [B] bool mask for sequence-level choice.
+                If set, reuse this mask instead of recomputing (keeps RQ layers consistent).
             current_epoch: Current training epoch (optional, used for hard/soft Gumbel switch)
 
         Returns:
