@@ -1,10 +1,21 @@
 # DIGER: Differentiable Semantic ID for Generative Recommendation
 
+This work has been **accepted as a full paper** at **SIGIR 2026** (ACM International Conference on Information Retrieval).
+
 ## Overview
 
 This repository contains the core implementation of our recommendation model with two training strategies:
 1. **Frequency-based Uncertainty Decay**: Dynamically switches between Gumbel sampling and deterministic indexing based on code usage frequency
 2. **Standard Deviation Uncertainty Decay**: Uses learnable uncertainty to balance task loss
+
+## Roadmap (TODO)
+
+**Current status:** Due to time constraints, what you see here is an **illustrative / reference implementation**—it sketches the model and training flow but is **not** yet the full end-to-end release we intend to ship.
+
+**Target:** Before **SIGIR 2026** (conference begins **July 20, 2026**), we plan to publish:
+
+- [ ] **Runnable code** — including configs and pre-trained checkpoints needed to reproduce the paper
+- [ ] **Dataset** — processed data and embeddings, with setup instructions in the README
 
 ## Repository Structure
 
