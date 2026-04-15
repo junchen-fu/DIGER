@@ -1,6 +1,6 @@
 # DIGER: Differentiable Semantic ID for Generative Recommendation
 
-This work has been **accepted as a full paper** at **SIGIR 2026** (ACM International Conference on Information Retrieval).
+This work has been **accepted as a full paper** at **SIGIR 2026**.
 
 ## Overview
 
