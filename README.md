@@ -14,7 +14,7 @@ This repository contains the core implementation of our recommendation model wit
 
 **Target:** Before **SIGIR 2026** (conference begins **July 20, 2026**), we plan to publish:
 
-- [ ] **Runnable code** — including configs and pre-trained checkpoints needed to reproduce the paper
+- [ ] **Runnable code** — including configs and pre-trained rq-vae checkpoints needed to reproduce the paper
 - [ ] **Dataset** — processed data and embeddings, with setup instructions in the README
 
 ## Repository Structure
