@@ -10,7 +10,7 @@
 
 ## News
 
-- **[2026-08]** Honored to be included in the generative recommender chapter of [RecSys-Industrial-Book](https://github.com/jhljx/RecSys-Industrial-Book) / 《推荐系统：工业架构与核心算法》.
+- **[2026-08]** Honored to be included in the generative recommender chapter of [RecSys-Industrial-Book](https://github.com/jhljx/RecSys-Industrial-Book/blob/main/ch09%20%E7%94%9F%E6%88%90%E5%BC%8F%E6%8E%A8%E8%8D%90%E6%A8%A1%E5%9D%97/%E7%AC%AC%E4%B9%9D%E7%AB%A0-%E7%94%9F%E6%88%90%E5%BC%8F%E6%8E%A8%E8%8D%90%E6%A8%A1%E5%9D%97.pdf) / 《推荐系统：工业架构与核心算法》.
 
 <p align="center">
   <img src="assets/figure1.png" alt="Conventional versus differentiable semantic IDs in generative recommendation" width="80%" />
