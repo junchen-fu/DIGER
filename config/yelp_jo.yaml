@@ -43,6 +43,9 @@ learner: AdamW
 data_path: ./dataset
 lr_scheduler_type: cosine
 gradient_accumulation_steps: 1
+reference_effective_batch_size: 256
+preserve_reference_forward_batch: true
+sync_quantizer_stats: true
 
 max_his_len: 50
 early_stop: 20

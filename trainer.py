@@ -9,6 +9,8 @@ from torch import optim
 from tqdm import tqdm
 import json
 import math
+import contextlib
+from itertools import islice
 from colorama import init
 from utils import ensure_dir, set_color, get_local_time
 from accelerate import PartialState
@@ -21,6 +23,15 @@ from vq import AutoSigmaGumbel, AutoSigmaGaussian, AutoSigmaSimple
 from collections import defaultdict
 from logging import getLogger
 init(autoreset=True)
+
+
+def accumulation_windows(iterable, window_size):
+    iterator = iter(iterable)
+    while True:
+        window = list(islice(iterator, window_size))
+        if not window:
+            return
+        yield window
 
 
 class Trainer(object):
@@ -80,20 +91,7 @@ class Trainer(object):
         self.max_steps = self.get_train_steps()
         self.warmup_steps = config["warmup_steps"]
 
-                                                                             
-                                                                      
-        freeze_semantic_embedding = bool(config.get('freeze_semantic_embedding', True))
-
-                                                         
-        for param in model_rec.parameters():
-            param.requires_grad = True
-
-                                                                           
-        if freeze_semantic_embedding:
-            semantic_emb_name = 'semantic_embedding'
-            for name, param in model_rec.named_parameters():
-                if name.startswith(semantic_emb_name):
-                    param.requires_grad = False
+        self._configure_trainable_parameters(model_rec, model_id)
 
         self.rec_optimizer = self._build_optimizer(model_rec, self.lr_rec, self.weight_decay)
 
@@ -119,6 +117,32 @@ class Trainer(object):
         self.model_id, self.train_data, self.valid_data, self.test_data = \
         self.accelerator.prepare(self.model_rec, self.rec_optimizer, self.rec_lr_scheduler,
                                  self.model_id, self.train_data, self.valid_data, self.test_data)
+        self.process_seed = init_device_seed(config['seed'], self.accelerator.process_index)
+
+    def _configure_trainable_parameters(self, model_rec, model_id):
+        for param in model_rec.parameters():
+            param.requires_grad = True
+        if self.config.get('freeze_semantic_embedding', True):
+            model_rec.semantic_embedding.requires_grad_(False)
+
+        if not self.config.get('end_to_end', False):
+            model_id.requires_grad_(False)
+            return
+
+        model_id.requires_grad_(True)
+        if self.config.get('freeze_id_encoder', False):
+            freeze_layers = int(self.config.get('freeze_id_encoder_layers', 0))
+            if freeze_layers <= 0:
+                model_id.encoder.requires_grad_(False)
+            else:
+                linear_layer_idx = 0
+                for module in model_id.encoder.mlp_layers.children():
+                    if isinstance(module, nn.Linear):
+                        if linear_layer_idx < freeze_layers:
+                            module.requires_grad_(False)
+                        linear_layer_idx += 1
+        if self.config.get('freeze_rq', False):
+            model_id.rq.requires_grad_(False)
 
     def _count_parameters(self, model, model_name="Model"):
         total_params = sum(p.numel() for p in model.parameters())
@@ -255,8 +279,8 @@ class Trainer(object):
         return unique_index
 
     def get_train_steps(self, epochs=None):
-        len_dataloader = len(self.train_data)
-        num_update_steps_per_epoch = len_dataloader // self.gradient_accumulation_steps
+        len_dataloader = math.ceil(len(self.train_data) / self.world_size)
+        num_update_steps_per_epoch = math.ceil(len_dataloader / self.gradient_accumulation_steps)
         num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
         if epochs is None:
             epochs = self.epochs
@@ -264,17 +288,294 @@ class Trainer(object):
 
         return max_steps
 
+    def _apply_code_loss_uncertainty(self, code_loss, sigma, model_id):
+        if (
+            sigma is None
+            or self.config.get('use_plain_code_loss', False)
+            or self.config.get('use_cosine_annealing', False)
+        ):
+            return code_loss, None
+
+        if self.config.get('use_simple_uncertainty_loss', False):
+            auto_sigma_module = getattr(model_id.rq.vq_layers[0], 'auto_sigma_module', None)
+            sigma_lambda = self.config.get('sigma_lambda', 0.5)
+            if auto_sigma_module is not None and hasattr(auto_sigma_module, 'compute_uncertainty_loss'):
+                return auto_sigma_module.compute_uncertainty_loss(
+                    code_loss, sigma, lambda_bias=sigma_lambda
+                )
+            effective_sigma = (sigma.abs() + sigma_lambda).clamp(min=1e-6)
+            return (
+                code_loss / (2 * effective_sigma ** 2) + torch.log(effective_sigma),
+                sigma_lambda,
+            )
+
+        transformed = AutoSigmaGumbel.compute_uncertainty_loss(
+            code_loss,
+            sigma,
+            reg_weight=self.config.get('sigma_reg_weight', 1.0),
+            annealing_threshold=self.config.get('annealing_threshold'),
+            annealing_slow_k=self.config.get('annealing_slow_k'),
+            annealing_slow_c=self.config.get('annealing_slow_c'),
+            annealing_fast_k=self.config.get('annealing_fast_k'),
+            annealing_fast_c=self.config.get('annealing_fast_c'),
+        )
+        return transformed, None
+
+    def _validate_preserved_forward_batch_config(self, loss_w):
+        if loss_w.get('qs_loss', 0) != 0:
+            raise ValueError(
+                'preserve_reference_forward_batch currently requires qs_loss_weight=0'
+            )
+        if self.config.get('auto_lambda_mode', 'fixed') == 'adaptive':
+            raise ValueError(
+                'preserve_reference_forward_batch does not support adaptive lambda updates'
+            )
+    def _train_epoch_rec_preserving_forward_batch(self, epoch_idx, loss_w, verbose=True):
+        self._validate_preserved_forward_batch_config(loss_w)
+        self.model_rec.train()
+        self.model_id.train()
+
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        model_id.reset_adaptive_selection_stats()
+
+        accumulation_steps = self.gradient_accumulation_steps
+        total_num = 0
+        total_loss = defaultdict(int)
+        iter_data = tqdm(
+            self.train_data,
+            total=len(self.train_data),
+            ncols=100,
+            desc=set_color(f"Train {epoch_idx}", "pink"),
+            disable=(not verbose) or (not self.accelerator.is_main_process),
+        )
+        if epoch_idx == 0:
+            global_forward_batch = (
+                self.config['batch_size'] * self.world_size * accumulation_steps
+            )
+            self.log(
+                '[Batch] RQ-VAE forward preserves the full accumulation window: '
+                f'global_forward_batch={global_forward_batch}'
+            )
+
+        for batch_window in accumulation_windows(iter_data, accumulation_steps):
+            actual_steps = len(batch_window)
+            total_num += 1
+            self.rec_optimizer.zero_grad()
+            if hasattr(self, 'id_optimizer'):
+                self.id_optimizer.zero_grad()
+
+            prepared_batches = []
+            target_parts = []
+            target_sizes = []
+            for batch in batch_window:
+                raw_input_ids = batch['input_ids'].to(self.device)
+                raw_attention_mask = batch['attention_mask'].to(self.device)
+                targets = batch['targets'].to(self.device)
+                batch_size = raw_input_ids.size(0)
+                input_ids = self.all_item_code[raw_input_ids].clone().detach().reshape(batch_size, -1)
+                labels = self.all_item_code[targets].clone().detach().reshape(batch_size, -1)
+                attention_mask = (input_ids != -1).bool()
+                flat_targets = targets.flatten()
+
+                prepared_batches.append((input_ids, attention_mask, labels))
+                target_parts.append(flat_targets)
+                target_sizes.append(flat_targets.numel())
+
+            target_flatten = torch.cat(target_parts, dim=0)
+            target_semantic_embs = model_rec.semantic_embedding(target_flatten)
+            use_gumbel = self.config.get('use_gumbel', True)
+            z_hat, vq_loss, _, _, target_code_logits, balance_loss, gate_reg_loss, sigma, z = \
+                self.model_id(
+                    target_semantic_embs,
+                    use_gumbel=use_gumbel,
+                    current_epoch=epoch_idx,
+                    global_step=self.global_step,
+                    return_latent=True,
+                )
+
+            recon_loss = F.mse_loss(z_hat, z)
+            token_indices = model_id.get_indices(target_semantic_embs)
+            z_parts = z.split(target_sizes, dim=0)
+            token_index_parts = token_indices.split(target_sizes, dim=0)
+
+            if sigma is not None and self.config.get('use_cosine_annealing', False):
+                current_epoch = self.global_step / max(1, self.max_steps) * self.epochs
+                cosine_factor = 0.5 * (1 + math.cos(math.pi * current_epoch / self.epochs))
+                target_std = max(1e-6, float(self.config.get('initial_std', 1.0)) * cosine_factor)
+                sigma.data.fill_(math.log2(target_std))
+
+            quantizer_losses = {
+                'recon_loss': recon_loss,
+                'vq_loss': vq_loss,
+            }
+            if balance_loss is not None:
+                quantizer_losses['balance_loss'] = balance_loss
+            if gate_reg_loss is not None:
+                quantizer_losses['gate_loss'] = gate_reg_loss
+            quantizer_loss = sum(
+                value * loss_w.get(name, 0)
+                for name, value in quantizer_losses.items()
+            )
+            if self.world_size > 1:
+                quantizer_loss = quantizer_loss + 0.0 * target_code_logits.float().sum()
+
+            code_losses = []
+            raw_code_losses = []
+            qs_losses = []
+            actual_lambda = None
+            for micro_idx, ((input_ids, attention_mask, labels), z_part, token_index_part) in enumerate(
+                zip(prepared_batches, z_parts, token_index_parts)
+            ):
+                is_last = micro_idx == actual_steps - 1
+                sync_context = (
+                    contextlib.nullcontext()
+                    if is_last
+                    else self.accelerator.no_sync(self.model_rec)
+                )
+                with sync_context:
+                    outputs = self.model_rec(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        quantizer_latent=z_part.detach(),
+                        token_indices=token_index_part,
+                        qs_beta=self.config.get('qs_beta', 0.25),
+                    )
+                    raw_code_loss = F.cross_entropy(
+                        outputs.logits.reshape(-1, self.code_num),
+                        labels.detach().reshape(-1),
+                    )
+                    code_loss, current_lambda = self._apply_code_loss_uncertainty(
+                        raw_code_loss,
+                        sigma.detach() if sigma is not None else None,
+                        model_id,
+                    )
+                    if current_lambda is not None:
+                        actual_lambda = current_lambda
+
+                    raw_code_losses.append(raw_code_loss.detach())
+                    code_losses.append(code_loss.detach())
+                    qs_losses.append(outputs.qs_loss.detach())
+
+                    micro_scale = accumulation_steps / actual_steps
+                    backward_loss = (
+                        code_loss * loss_w.get('code_loss', 0)
+                        + outputs.qs_loss * loss_w.get('qs_loss', 0)
+                    ) * micro_scale
+                    if self.world_size > 1:
+                        backward_loss = backward_loss + 0.0 * (
+                            outputs.seq_project_latents.sum()
+                            + outputs.dec_latents.sum()
+                        )
+
+                    if is_last:
+                        backward_loss = backward_loss + accumulation_steps * quantizer_loss
+                        if sigma is not None and not self.config.get('use_plain_code_loss', False):
+                            mean_raw_code_loss = torch.stack(raw_code_losses).mean()
+                            sigma_objective, actual_lambda = self._apply_code_loss_uncertainty(
+                                mean_raw_code_loss, sigma, model_id
+                            )
+                            sigma_proxy = sigma_objective - sigma_objective.detach()
+                            backward_loss = backward_loss + (
+                                accumulation_steps
+                                * loss_w.get('code_loss', 0)
+                                * sigma_proxy
+                            )
+
+                    self.accelerator.backward(backward_loss)
+
+            self.accelerator.clip_grad_norm_(self.model_rec.parameters(), 1)
+            if hasattr(self, 'id_optimizer'):
+                self.accelerator.clip_grad_norm_(self.model_id.parameters(), 1)
+
+            mean_code_loss = torch.stack(code_losses).mean()
+            mean_raw_code_loss = torch.stack(raw_code_losses).mean()
+            mean_qs_loss = torch.stack(qs_losses).mean()
+
+            self.rec_optimizer.step()
+            self.rec_lr_scheduler.step()
+            if hasattr(self, 'id_optimizer'):
+                if self.config.get('use_dynamic_sigma_lr', False) and hasattr(self, 'lr_sigma'):
+                    sigma_lr_multiplier = 10.0 if mean_code_loss.item() < 2.0 else 1.0
+                    for param_group in self.id_optimizer.param_groups:
+                        if abs(param_group['lr'] - self.lr_sigma) < 1e-8 or \
+                                abs(param_group['lr'] - self.lr_sigma * 10.0) < 1e-8:
+                            param_group['lr'] = self.lr_sigma * sigma_lr_multiplier
+                self.id_optimizer.step()
+                self.id_lr_scheduler.step()
+
+            if (
+                sigma is not None
+                and self.global_step % 10 == 0
+                and self.accelerator.is_main_process
+                and self.config.get('use_simple_uncertainty_loss', False)
+                and not self.config.get('use_plain_code_loss', False)
+                and actual_lambda is not None
+            ):
+                lambda_value = (
+                    actual_lambda
+                    if isinstance(actual_lambda, float)
+                    else actual_lambda.item()
+                )
+                target_sigma = math.sqrt(max(0, mean_raw_code_loss.item())) - lambda_value
+                self.log(
+                    f'[Simple Uncertainty] sigma={sigma.item():.4f}, '
+                    f'Loss={mean_raw_code_loss.item():.4f}, lambda={lambda_value:.4f} '
+                    f'(fixed), Target_sigma={target_sigma:.4f}'
+                )
+
+            self.global_step += 1
+
+            loss_for_logging = mean_code_loss * loss_w.get('code_loss', 0) + quantizer_loss.detach()
+            loss_values = {
+                'loss': self.accelerator.gather(loss_for_logging).mean().item(),
+                'code_loss': self.accelerator.gather(mean_code_loss).mean().item(),
+                'recon_loss': self.accelerator.gather(recon_loss.detach()).mean().item(),
+                'vq_loss': self.accelerator.gather(vq_loss.detach()).mean().item(),
+                'qs_loss': self.accelerator.gather(mean_qs_loss).mean().item(),
+            }
+            if balance_loss is not None:
+                loss_values['balance_loss'] = self.accelerator.gather(
+                    balance_loss.detach()
+                ).mean().item()
+            if gate_reg_loss is not None:
+                loss_values['gate_loss'] = self.accelerator.gather(
+                    gate_reg_loss.detach()
+                ).mean().item()
+            if sigma is not None:
+                loss_values['sigma'] = self.accelerator.gather(sigma.detach()).mean().item()
+
+            for name, value in loss_values.items():
+                total_loss[name] += value
+            iter_data.set_postfix(loss=loss_values['loss'])
+
+        for name in total_loss:
+            total_loss[name] = round(total_loss[name] / total_num, 4)
+
+        self.accelerator.wait_for_everyone()
+        return total_loss
+
     def _train_epoch_rec(self, epoch_idx, loss_w, freeze_id=False, verbose=True):
+
+        preserve_forward_batch = self.config.get('preserve_reference_forward_batch', True)
+        if (
+            preserve_forward_batch
+            and self.gradient_accumulation_steps > 1
+            and self.config.get('end_to_end', False)
+            and not freeze_id
+        ):
+            return self._train_epoch_rec_preserving_forward_batch(
+                epoch_idx, loss_w=loss_w, verbose=verbose
+            )
 
         self.model_rec.train()
                                                                        
         self.model_id.train()
 
-                                                                        
-        if dist.is_initialized():
-            self.model_id.module.reset_adaptive_selection_stats()
-        else:
-            self.model_id.reset_adaptive_selection_stats()
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        model_id.reset_adaptive_selection_stats()
 
         total_num = 0
         total_loss = defaultdict(int)
@@ -287,7 +588,7 @@ class Trainer(object):
                     )
 
         for batch_idx, batch in enumerate(iter_data):
-            with self.accelerator.accumulate(self.model_rec):
+            with self.accelerator.accumulate(self.model_rec, self.model_id):
 
                 total_num += 1
 
@@ -305,54 +606,16 @@ class Trainer(object):
                 attention_mask = (input_ids != -1).bool()
 
                 target_flatten = targets.flatten()
-                if dist.is_initialized():
-                    target_semantic_embs = self.model_rec.module.semantic_embedding(target_flatten)
-                else:
-                    target_semantic_embs = self.model_rec.semantic_embedding(target_flatten)
-
-                                                                              
-                                                               
-                                                   
-                                                                              
-                                             
-                if dist.is_initialized():
-                    z = self.model_id.module.encoder(target_semantic_embs)              
-                else:
-                    z = self.model_id.encoder(target_semantic_embs)                      
-
-                                                                                     
-                                                            
-                                                           
-                                                                
+                target_semantic_embs = model_rec.semantic_embedding(target_flatten)
                 use_gumbel = self.config.get('use_gumbel', not freeze_id)
-
-                                                                                        
-                                                                     
-                if dist.is_initialized():
-                    stop_gumbel_epoch = self.model_id.module.stop_gumbel_sampling_epoch
-                    use_indicator_ste = self.model_id.module.use_indicator_ste
-                                                                 
-                    current_tau = self.model_id.module.get_current_tau(self.global_step)
-                else:
-                    stop_gumbel_epoch = self.model_id.stop_gumbel_sampling_epoch
-                    use_indicator_ste = self.model_id.use_indicator_ste
-                                                                 
-                    current_tau = self.model_id.get_current_tau(self.global_step)
-
-                use_gumbel_sampling = (stop_gumbel_epoch == 0) or (epoch_idx < stop_gumbel_epoch)
-
-                if dist.is_initialized():
-                    z_hat, vq_loss, _, _, target_code_logits, balance_loss, gate_reg_loss, sigma = \
-                        self.model_id.module.rq(z, use_gumbel=use_gumbel, tau=current_tau,
-                                               use_indicator_ste=use_indicator_ste,
-                                               use_gumbel_sampling=use_gumbel_sampling,
-                                               current_epoch=epoch_idx)
-                else:
-                    z_hat, vq_loss, _, _, target_code_logits, balance_loss, gate_reg_loss, sigma = \
-                        self.model_id.rq(z, use_gumbel=use_gumbel, tau=current_tau,
-                                        use_indicator_ste=use_indicator_ste,
-                                        use_gumbel_sampling=use_gumbel_sampling,
-                                        current_epoch=epoch_idx)
+                z_hat, vq_loss, _, _, target_code_logits, balance_loss, gate_reg_loss, sigma, z = \
+                    self.model_id(
+                        target_semantic_embs,
+                        use_gumbel=use_gumbel,
+                        current_epoch=epoch_idx,
+                        global_step=self.global_step,
+                        return_latent=True,
+                    )
 
                                                                       
                                                             
@@ -365,39 +628,8 @@ class Trainer(object):
                                                                                   
                                                                              
                                                                          
-                if dist.is_initialized():
-                    token_indices = self.model_id.module.get_indices(target_semantic_embs)                      
-                else:
-                    token_indices = self.model_id.get_indices(target_semantic_embs)                      
-
-                                                                
-                                                                               
-                                                                               
-                num_rq_layers = token_indices.shape[1]     
-                token_embs_list = []
-                for i in range(num_rq_layers):
-                    if dist.is_initialized():
-                        emb = self.model_rec.module.token_embeddings[i](token_indices[:, i])                    
-                    else:
-                        emb = self.model_rec.token_embeddings[i](token_indices[:, i])                    
-                    token_embs_list.append(emb)
-
-                                                                                
-                token_embs = torch.stack(token_embs_list, dim=1).mean(dim=1)                    
-
-                                                                                 
-                                                                    
-                if dist.is_initialized():
-                    z_projected = self.model_rec.module.qs_projector(z)                                  
-                else:
-                    z_projected = self.model_rec.qs_projector(z)                                  
-
-                                                        
-                                                                                          
-                                                                                            
+                token_indices = model_id.get_indices(target_semantic_embs)
                 qs_beta = self.config.get('qs_beta', 0.25)
-                qs_loss = F.mse_loss(z_projected, token_embs.detach()) + \
-                          qs_beta * F.mse_loss(z_projected.detach(), token_embs)
 
                                                             
                                                               
@@ -406,9 +638,13 @@ class Trainer(object):
                                                     
                 outputs = self.model_rec(input_ids=input_ids,
                                          attention_mask=attention_mask,
-                                         labels=labels)
+                                         labels=labels,
+                                         quantizer_latent=z,
+                                         token_indices=token_indices,
+                                         qs_beta=qs_beta)
 
                 logits = outputs.logits                               
+                qs_loss = outputs.qs_loss
 
                                       
                 code_loss = F.cross_entropy(logits.reshape(-1, self.code_num), labels.detach().reshape(-1))
@@ -448,7 +684,7 @@ class Trainer(object):
                         sigma.data.fill_(target_sigma)
 
                                                                                      
-                        if self.global_step % 10 == 0 and self.accelerator.is_main_process:
+                        if self.accelerator.sync_gradients and self.global_step % 10 == 0 and self.accelerator.is_main_process:
                             self.log(f"[Cosine Annealing] Epoch={current_epoch:.2f}/{T_max}, σ={target_sigma:.4f}, std={target_std:.4f} (Fixed)")
                     else:
                                                                           
@@ -458,7 +694,7 @@ class Trainer(object):
                         if use_plain_code_loss:
                                                                                               
                                                             
-                            if self.global_step % 10 == 0 and self.accelerator.is_main_process:
+                            if self.accelerator.sync_gradients and self.global_step % 10 == 0 and self.accelerator.is_main_process:
                                 sigma_val = sigma.item()
                                 if use_simple_uncertainty_loss:
                                     self.log(f"[Plain Loss] σ={sigma_val:.4f} (direct), code_loss={code_loss.item():.4f}")
@@ -469,12 +705,7 @@ class Trainer(object):
                             original_code_loss = code_loss.item()
                             sigma_lambda = self.config.get('sigma_lambda', 0.5)
 
-                                                                                                                 
-                            auto_sigma_module = None
-                            if dist.is_initialized():
-                                auto_sigma_module = getattr(self.model_id.module.rq.vq_layers[0], 'auto_sigma_module', None)
-                            else:
-                                auto_sigma_module = getattr(self.model_id.rq.vq_layers[0], 'auto_sigma_module', None)
+                            auto_sigma_module = getattr(model_id.rq.vq_layers[0], 'auto_sigma_module', None)
 
                             if auto_sigma_module is not None and hasattr(auto_sigma_module, 'compute_uncertainty_loss'):
                                                                                           
@@ -487,7 +718,7 @@ class Trainer(object):
                                 code_loss = AutoSigmaSimple.compute_uncertainty_loss(code_loss, sigma, lambda_bias=sigma_lambda)
                                 actual_lambda = sigma_lambda
 
-                            if self.global_step % 10 == 0 and self.accelerator.is_main_process:
+                            if self.accelerator.sync_gradients and self.global_step % 10 == 0 and self.accelerator.is_main_process:
                                 sigma_val = sigma.item()
                                 lambda_val = actual_lambda if isinstance(actual_lambda, float) else actual_lambda.item()
                                 import math
@@ -525,7 +756,7 @@ class Trainer(object):
                                 annealing_fast_c=annealing_fast_c
                             )
                                                           
-                            if self.global_step % 10 == 0 and self.accelerator.is_main_process:
+                            if self.accelerator.sync_gradients and self.global_step % 10 == 0 and self.accelerator.is_main_process:
                                 sigma_val = sigma.item()                       
                                                                                                       
                                 import math
@@ -553,22 +784,30 @@ class Trainer(object):
                     losses['gate_loss'] = gate_reg_loss
 
                 loss = sum([v * loss_w.get(k, 0) for k, v in losses.items()])
+                if self.world_size > 1:
+                    loss = loss + 0.0 * (
+                        outputs.seq_project_latents.sum()
+                        + outputs.dec_latents.sum()
+                        + target_code_logits.float().sum()
+                    )
 
                 self.accelerator.backward(loss)
 
-                self.accelerator.clip_grad_norm_(self.model_rec.parameters(), 1)
-                if hasattr(self, 'id_optimizer') and not freeze_id:
-                    self.accelerator.clip_grad_norm_(self.model_id.parameters(), 1)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model_rec.parameters(), 1)
+                    if hasattr(self, 'id_optimizer') and not freeze_id:
+                        self.accelerator.clip_grad_norm_(self.model_id.parameters(), 1)
 
                 self.rec_optimizer.step()
-                self.rec_lr_scheduler.step()
+                if self.accelerator.sync_gradients:
+                    self.rec_lr_scheduler.step()
                                                                     
                 if hasattr(self, 'id_optimizer') and not freeze_id:
                                                                  
                                                                                          
                                                                                       
                     use_dynamic_sigma_lr = self.config.get('use_dynamic_sigma_lr', False)
-                    if use_dynamic_sigma_lr and hasattr(self, 'lr_sigma') and self.lr_sigma is not None:
+                    if self.accelerator.sync_gradients and use_dynamic_sigma_lr and hasattr(self, 'lr_sigma') and self.lr_sigma is not None:
                         threshold_loss = 2.0                    
                         current_code_loss = code_loss.item() if isinstance(code_loss, torch.Tensor) else code_loss
 
@@ -595,10 +834,11 @@ class Trainer(object):
                             self.log(f"[Sigma LR] Stage={stage}, Loss={current_code_loss:.4f}, σ_lr={actual_sigma_lr:.6f} ({sigma_lr_multiplier:.1f}x)")
 
                     self.id_optimizer.step()
-                    self.id_lr_scheduler.step()
+                    if self.accelerator.sync_gradients:
+                        self.id_lr_scheduler.step()
 
-                                                         
-                self.global_step += 1
+                if self.accelerator.sync_gradients:
+                    self.global_step += 1
 
                            
                 code_loss_mean = self.accelerator.gather(code_loss).mean().item()
@@ -719,60 +959,24 @@ class Trainer(object):
 
                                          
         end_to_end = self.config.get('end_to_end', False)
+        model_rec_unwrapped = self.accelerator.unwrap_model(self.model_rec)
+        model_id_unwrapped = self.accelerator.unwrap_model(self.model_id)
 
         if end_to_end:
-                                                             
-            for param in self.model_rec.parameters():
-                param.requires_grad = True
-
-                                                  
-            freeze_semantic_embedding = bool(self.config.get('freeze_semantic_embedding', True))
-            if freeze_semantic_embedding:
-                semantic_emb_name = 'module.semantic_embedding' if dist.is_initialized() else 'semantic_embedding'
-                for name, param in self.model_rec.named_parameters():
-                    if name.startswith(semantic_emb_name):
-                        param.requires_grad = False
-
             self.log(f'[Training Mode] Recommender model unfrozen (semantic_embedding frozen)')
 
-                                                     
-            for param in self.model_id.parameters():
-                param.requires_grad = True
-
-                                            
             freeze_id_encoder = self.config.get('freeze_id_encoder', False)
-            freeze_id_encoder_layers = self.config.get('freeze_id_encoder_layers', 0)                                          
+            freeze_id_encoder_layers = self.config.get('freeze_id_encoder_layers', 0)
             freeze_rq = self.config.get('freeze_rq', False)
 
             if freeze_id_encoder:
-                                                                                     
-                                                                               
                 if freeze_id_encoder_layers > 0:
-                                                                      
-                                                                                           
-                                                                                 
-                    encoder_modules = list(self.model_id.encoder.mlp_layers.children())
-                    linear_layer_idx = 0
-                    frozen_count = 0
-
-                    for module in encoder_modules:
-                        if isinstance(module, nn.Linear):
-                            if linear_layer_idx < freeze_id_encoder_layers:
-                                for param in module.parameters():
-                                    param.requires_grad = False
-                                frozen_count += 1
-                            linear_layer_idx += 1
-
+                    encoder_modules = list(model_id_unwrapped.encoder.mlp_layers.children())
                     total_linear_layers = sum(1 for m in encoder_modules if isinstance(m, nn.Linear))
-                    self.log(f'[Training Mode] ID tokenizer encoder: {frozen_count}/{total_linear_layers} layers FROZEN (bottom {freeze_id_encoder_layers} layers)')
+                    self.log(f'[Training Mode] ID tokenizer encoder: {freeze_id_encoder_layers}/{total_linear_layers} layers FROZEN (bottom {freeze_id_encoder_layers} layers)')
                 else:
-                                                                   
-                    for param in self.model_id.encoder.parameters():
-                        param.requires_grad = False
                     self.log(f'[Training Mode] ID tokenizer encoder FROZEN (all layers)')
             if freeze_rq:
-                for param in self.model_id.rq.parameters():
-                    param.requires_grad = False
                 self.log(f'[Training Mode] ID tokenizer RQ quantizer FROZEN')
 
                                         
@@ -858,23 +1062,7 @@ class Trainer(object):
             self.log(f'[Training Mode] End-to-end training enabled')
             self.log(f'[Training Mode] Loss weights: {dict(loss_w)}')
         else:
-                                                             
-            for param in self.model_rec.parameters():
-                param.requires_grad = True
-
-                                                  
-            freeze_semantic_embedding = bool(self.config.get('freeze_semantic_embedding', True))
-            if freeze_semantic_embedding:
-                semantic_emb_name = 'module.semantic_embedding' if dist.is_initialized() else 'semantic_embedding'
-                for name, param in self.model_rec.named_parameters():
-                    if name.startswith(semantic_emb_name):
-                        param.requires_grad = False
-
             self.log(f'[Training Mode] Recommender model unfrozen (semantic_embedding frozen)')
-
-                                      
-            for param in self.model_id.parameters():
-                param.requires_grad = False
 
                                               
             loss_w['code_loss'] = 1
@@ -895,14 +1083,8 @@ class Trainer(object):
 
                                                    
         self.log("ID Tokenizer Module Breakdown:")
-        self._count_module_parameters(self.model_id, "encoder")
-        self._count_module_parameters(self.model_id, "rq")
-
-                                              
-        if dist.is_initialized():
-            model_id_unwrapped = self.model_id.module
-        else:
-            model_id_unwrapped = self.model_id
+        self._count_module_parameters(model_id_unwrapped, "encoder")
+        self._count_module_parameters(model_id_unwrapped, "rq")
 
         sigma_params = [name for name, p in model_id_unwrapped.named_parameters() if 'sigma' in name.lower()]
         if sigma_params:
@@ -936,46 +1118,18 @@ class Trainer(object):
                                                                  
             freeze_id_epochs = self.config.get('freeze_id_epochs', 0)
             if end_to_end and epoch_idx < freeze_id_epochs:
-                               
-                for param in self.model_id.parameters():
-                    param.requires_grad = False
                 if epoch_idx == 0:
                     self.log(f'[Training Mode] RQ-VAE FROZEN for first {freeze_id_epochs} epochs')
                     self.log(f'[Training Mode] Will unfreeze at epoch {freeze_id_epochs}')
-            elif end_to_end and epoch_idx == freeze_id_epochs:
-                                                    
-                for param in self.model_id.parameters():
-                    param.requires_grad = True
-
-                                                         
+            elif end_to_end and freeze_id_epochs > 0 and epoch_idx == freeze_id_epochs:
                 freeze_id_encoder = self.config.get('freeze_id_encoder', False)
                 freeze_id_encoder_layers = self.config.get('freeze_id_encoder_layers', 0)
                 freeze_rq = self.config.get('freeze_rq', False)
 
-                if freeze_id_encoder:
-                                                                                         
-                    if freeze_id_encoder_layers > 0:
-                        encoder_modules = list(self.model_id.encoder.mlp_layers.children())
-                        linear_layer_idx = 0
-
-                        for module in encoder_modules:
-                            if isinstance(module, nn.Linear):
-                                if linear_layer_idx < freeze_id_encoder_layers:
-                                    for param in module.parameters():
-                                        param.requires_grad = False
-                                linear_layer_idx += 1
-                    else:
-                                                   
-                        for param in self.model_id.encoder.parameters():
-                            param.requires_grad = False
-                if freeze_rq:
-                    for param in self.model_id.rq.parameters():
-                        param.requires_grad = False
-
                 self.log(f'[Training Mode] RQ-VAE UNFROZEN at epoch {epoch_idx}!')
                 if freeze_id_encoder:
                     if freeze_id_encoder_layers > 0:
-                        encoder_modules = list(self.model_id.encoder.mlp_layers.children())
+                        encoder_modules = list(model_id_unwrapped.encoder.mlp_layers.children())
                         total_linear_layers = sum(1 for m in encoder_modules if isinstance(m, nn.Linear))
                         self.log(f'[Training Mode] (encoder: {freeze_id_encoder_layers}/{total_linear_layers} bottom layers still frozen)')
                     else:
@@ -1006,10 +1160,7 @@ class Trainer(object):
 
                                                                           
             if self.config.get('use_adaptive_selection', False) and not is_id_frozen:
-                if dist.is_initialized():
-                    stats = self.model_id.module.get_adaptive_selection_stats()
-                else:
-                    stats = self.model_id.get_adaptive_selection_stats()
+                stats = model_id_unwrapped.get_adaptive_selection_stats()
 
                 if stats['total_count'] > 0:
                     self.log(f"\n{'='*60}")
@@ -1056,6 +1207,10 @@ class Trainer(object):
             if hasattr(self, 'id_lr_scheduler'):
                 self.log(f'[Epoch {epoch_idx}] ID lr: {self.id_lr_scheduler.get_lr()}')
 
+            self.accelerator.wait_for_everyone()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
                                                                   
             if end_to_end:
                 all_item_code = self.get_code(epoch_idx=epoch_idx, verbose=verbose)
@@ -1079,6 +1234,8 @@ class Trainer(object):
             self.log(f'[Epoch {epoch_idx}] Val Results: {total_metrics}')
 
             self.accelerator.wait_for_everyone()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if stop:
                 break
@@ -1100,12 +1257,8 @@ class Trainer(object):
             self.log("")
 
                              
-            if dist.is_initialized():
-                safe_load(self.model_rec.module, stage1_ckpt_path, verbose=verbose)
-                safe_load(self.model_id.module, stage1_ckpt_path+'.rqvae', verbose=verbose)
-            else:
-                safe_load(self.model_rec, stage1_ckpt_path, verbose=verbose)
-                safe_load(self.model_id, stage1_ckpt_path+'.rqvae', verbose=verbose)
+            safe_load(self.accelerator.unwrap_model(self.model_rec), stage1_ckpt_path, verbose=verbose)
+            safe_load(self.accelerator.unwrap_model(self.model_id), stage1_ckpt_path+'.rqvae', verbose=verbose)
 
                         
             best_code = json.load(open(stage1_ckpt_path[:-3]+'.code.json'))
@@ -1165,30 +1318,18 @@ class Trainer(object):
                 self.log(f"Loading best checkpoint from Stage 1: {stage1_ckpt}")
 
                                  
-                if dist.is_initialized():
-                    safe_load(self.model_rec.module, stage1_ckpt, verbose=verbose)
-                    safe_load(self.model_id.module, stage1_ckpt+'.rqvae', verbose=verbose)
-                else:
-                    safe_load(self.model_rec, stage1_ckpt, verbose=verbose)
-                    safe_load(self.model_id, stage1_ckpt+'.rqvae', verbose=verbose)
+                safe_load(self.accelerator.unwrap_model(self.model_rec), stage1_ckpt, verbose=verbose)
+                safe_load(self.accelerator.unwrap_model(self.model_id), stage1_ckpt+'.rqvae', verbose=verbose)
 
                             
                 best_code = json.load(open(stage1_ckpt[:-3]+'.code.json'))
                 self.all_item_code = torch.tensor(best_code).to(self.device)
 
                                         
-            for param in self.model_id.parameters():
-                param.requires_grad = False
             self.log('[Frozen Tokenizer] ID Tokenizer COMPLETELY FROZEN')
 
-                                                                                 
-                                                                             
-            if dist.is_initialized():
-                self.model_id.module.stop_gumbel_sampling_epoch = -1
-                self.log('[Frozen Tokenizer] Force deterministic: stop_gumbel_sampling_epoch = -1')
-            else:
-                self.model_id.stop_gumbel_sampling_epoch = -1
-                self.log('[Frozen Tokenizer] Force deterministic: stop_gumbel_sampling_epoch = -1')
+            self.accelerator.unwrap_model(self.model_id).stop_gumbel_sampling_epoch = -1
+            self.log('[Frozen Tokenizer] Force deterministic: stop_gumbel_sampling_epoch = -1')
 
                                                                      
             frozen_phase_loss_w = {
@@ -1329,12 +1470,8 @@ class Trainer(object):
 
         if load_best_model:
             ckpt_file = model_file or self.best_ckpt
-            if dist.is_initialized():
-                safe_load(self.model_rec.module, ckpt_file, verbose=verbose)
-                safe_load(self.model_id.module, ckpt_file+'.rqvae', verbose=verbose)
-            else:
-                safe_load(self.model_rec, ckpt_file, verbose=verbose)
-                safe_load(self.model_id, ckpt_file+'.rqvae', verbose=verbose)
+            safe_load(self.accelerator.unwrap_model(self.model_rec), ckpt_file, verbose=verbose)
+            safe_load(self.accelerator.unwrap_model(self.model_id), ckpt_file+'.rqvae', verbose=verbose)
 
             code = json.load(open(ckpt_file[:-3]+'.code.json'))
 
@@ -1375,8 +1512,8 @@ class Trainer(object):
             labels = item_code[labels].clone().detach().reshape(B, -1)
             attention_mask = (input_ids != -1).bool()
 
-            if dist.is_initialized():
-                preds = self.model_rec.module.generate(input_ids=input_ids, attention_mask=attention_mask, n_return_sequences=10)
+            if self.accelerator.num_processes > 1:
+                preds = self.accelerator.unwrap_model(self.model_rec).generate(input_ids=input_ids, attention_mask=attention_mask, n_return_sequences=10)
                 all_preds, all_labels = self.accelerator.gather_for_metrics((preds, labels))
                 _metrics = self.evaluate(all_preds, all_labels)
                 total += len(all_labels)
@@ -1397,12 +1534,10 @@ class Trainer(object):
     def get_code(self, epoch_idx, verbose=True):
         self.model_rec.eval()
         self.model_id.eval()
-        if dist.is_initialized():
-            all_item_embs = self.model_rec.module.semantic_embedding.weight.data[1:]
-            all_item_prefix = self.model_id.module.get_indices(all_item_embs).detach().cpu().numpy()
-        else:
-            all_item_embs = self.model_rec.semantic_embedding.weight.data[1:]
-            all_item_prefix = self.model_id.get_indices(all_item_embs).detach().cpu().numpy()
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        all_item_embs = model_rec.semantic_embedding.weight.data[1:]
+        all_item_prefix = model_id.get_indices(all_item_embs).detach().cpu().numpy()
 
 
         if verbose:

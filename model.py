@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional
 from transformers import GenerationMixin
@@ -18,6 +19,7 @@ class QuantizeOutput(ModelOutput):
     seq_latents: Optional[torch.FloatTensor] = None
     seq_project_latents: Optional[torch.FloatTensor] = None
     dec_latents: Optional[torch.FloatTensor] = None
+    qs_loss: Optional[torch.FloatTensor] = None
         
         
 class Model(nn.Module, GenerationMixin):
@@ -98,7 +100,8 @@ class Model(nn.Module, GenerationMixin):
         return inputs_embeds
     
     def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, labels=None, decoder_input_ids=None,
-                decoder_inputs_embeds=None, encoder_outputs=None, **kwargs):
+                decoder_inputs_embeds=None, encoder_outputs=None, quantizer_latent=None,
+                token_indices=None, qs_beta=0.25, **kwargs):
         
         if input_ids is not None:
             inputs_embeds = self.get_input_embeddings(input_ids, attention_mask)
@@ -145,12 +148,23 @@ class Model(nn.Module, GenerationMixin):
         dec_latents = model_outputs.decoder_hidden_states[-1].clone()
         dec_latents = dec_latents[:,0,:]
         dec_latents = self.dec_adapter(dec_latents)
+
+        qs_loss = None
+        if quantizer_latent is not None and token_indices is not None:
+            token_embs = torch.stack([
+                self.token_embeddings[i](token_indices[:, i])
+                for i in range(token_indices.shape[1])
+            ], dim=1).mean(dim=1)
+            z_projected = self.qs_projector(quantizer_latent)
+            qs_loss = F.mse_loss(z_projected, token_embs.detach()) + \
+                qs_beta * F.mse_loss(z_projected.detach(), token_embs)
         
         outputs = QuantizeOutput(
             logits=code_logits,
             seq_latents=seq_last_latents,
             seq_project_latents=seq_project_latents,
-            dec_latents=dec_latents
+            dec_latents=dec_latents,
+            qs_loss=qs_loss,
         )
         return outputs
     

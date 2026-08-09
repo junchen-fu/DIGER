@@ -7,7 +7,8 @@ from data import SequentialSplitDataset, Collator
 from torch.utils.data import DataLoader
 from trainer import Trainer
 from transformers import T5Config, T5ForConditionalGeneration
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import broadcast_object_list
 from model import Model
 from utils import *
 from vq import RQVAE
@@ -31,6 +32,22 @@ def train(config, verbose=True, rank=0):
     accelerator = config['accelerator']
     
     log(f'Device: {config["device"]}', accelerator, logger)
+    batch_info = get_training_batch_info(
+        config['batch_size'], accelerator.num_processes,
+        config['gradient_accumulation_steps']
+    )
+    log(
+        '[Batch] per_device={per_device_batch_size}, processes={num_processes}, '
+        'accumulation={gradient_accumulation_steps}, effective={effective_batch_size}'.format(**batch_info),
+        accelerator, logger
+    )
+    reference_batch_size = config.get('reference_effective_batch_size')
+    if reference_batch_size and batch_info['effective_batch_size'] != reference_batch_size:
+        log(
+            f'[Batch] Effective batch size {batch_info["effective_batch_size"]} differs from '
+            f'the paper setting {reference_batch_size}.',
+            accelerator, logger, level='warning'
+        )
     log(f'Config: {str(config)}', accelerator, logger)
 
     item2id, num_items, train, valid, test = load_split_data(config)
@@ -66,6 +83,12 @@ def train(config, verbose=True, rank=0):
         )
     
     t5 = T5ForConditionalGeneration(config=model_config)
+    if config.get('gradient_checkpointing', False):
+        t5.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={'use_reentrant': False}
+        )
+        t5.config.use_cache = False
+        log('[Memory] T5 gradient checkpointing enabled', accelerator, logger)
     model_rec = Model(config=config, model=t5, n_items=num_items,
                   code_length=code_length, code_number=code_num)
     
@@ -135,13 +158,22 @@ def train(config, verbose=True, rank=0):
     trainer = Trainer(config=config, model_rec=model_rec, model_id=model_id, accelerator=accelerator, train_data=train_data_loader,
                       valid_data=valid_data_loader, test_data=test_data_loader, eos_token_id=eos_token_id)
 
-                              
+    process_seeds = accelerator.gather(
+        torch.tensor([trainer.process_seed], device=accelerator.device, dtype=torch.long)
+    )
+    log(
+        f'[Seed] per_process_cuda={process_seeds.cpu().tolist()}',
+        accelerator,
+        logger,
+    )
+
     best_score = trainer.train(verbose=verbose)
     test_results = trainer.test()
 
     if accelerator.is_main_process:
         log(f"Best Validation Score: {best_score}", accelerator, logger)
         log(f"Test Results: {test_results}", accelerator, logger)
+    accelerator.end_training()
 
 
 if __name__=="__main__":
@@ -153,30 +185,33 @@ if __name__=="__main__":
     config.update(yaml.safe_load(open(args.config, 'r')))
     config.update(command_line_configs)
 
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    config = convert_config_dict(config)
+    gradient_accumulation_steps = int(config.get('gradient_accumulation_steps', 1))
+    if gradient_accumulation_steps < 1:
+        raise ValueError('gradient_accumulation_steps must be at least 1')
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        step_scheduler_with_optimizer=False,
+        kwargs_handlers=[ddp_kwargs],
+    )
 
     dataset = config['dataset']
-    
-    local_time = get_local_time()
-    config['device'], config['use_ddp'] = init_device()
-    accelerator = Accelerator()
-
-                                                       
-    all_run_local_time = accelerator.gather_for_metrics([local_time])
-    config['run_local_time'] = all_run_local_time[0]
+    config['device'] = accelerator.device
+    config['use_ddp'] = accelerator.num_processes > 1
+    run_local_time = [get_local_time() if accelerator.is_main_process else None]
+    broadcast_object_list(run_local_time)
+    config['run_local_time'] = run_local_time[0]
 
     ckpt_name = get_file_name(config)
 
     config['save_path'] =f'./myckpt/{dataset}/{ckpt_name}'
     
-    config = convert_config_dict(config)
-    config['accelerator'] = Accelerator()
+    config['accelerator'] = accelerator
     
         
-    train(config, verbose=local_rank==0, rank=local_rank)
-
-    
+    train(config, verbose=accelerator.is_main_process, rank=accelerator.process_index)
 
     
     

@@ -309,6 +309,28 @@ def init_seed(seed, reproducibility):
         torch.backends.cudnn.deterministic = False
 
 
+def init_device_seed(seed, process_index):
+    process_seed = int(seed) + int(process_index)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(process_seed)
+    return process_seed
+
+
+def get_training_batch_info(per_device_batch_size, num_processes, gradient_accumulation_steps):
+    per_device_batch_size = int(per_device_batch_size)
+    num_processes = int(num_processes)
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if min(per_device_batch_size, num_processes, gradient_accumulation_steps) < 1:
+        raise ValueError('Batch size, process count, and accumulation steps must all be positive')
+
+    return {
+        'per_device_batch_size': per_device_batch_size,
+        'num_processes': num_processes,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'effective_batch_size': per_device_batch_size * num_processes * gradient_accumulation_steps,
+    }
+
+
 def get_file_name(config: dict, suffix: str = ''):
     config_str = "".join([str(value) for key, value in config.items() if (key != 'accelerator' and key != 'device') ])
     md5 = hashlib.md5(config_str.encode(encoding="utf-8")).hexdigest()[:6]

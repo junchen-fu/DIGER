@@ -44,6 +44,8 @@ The released scripts cover all three datasets used in the table: Beauty, Instrum
 
 ```text
 DIGER/
+├── accelerate_config.yaml
+├── accelerate_config_multi_gpu.yaml
 ├── main.py
 ├── model.py
 ├── trainer.py
@@ -59,11 +61,13 @@ DIGER/
 │   └── yelp/
 ├── rqvae_ckpt/
 │   ├── beauty/best_collision_model.pth
+│   ├── beauty/best_collision_model_two_gpu_preview.pth
 │   ├── instruments/best_collision_model.pth
 │   └── yelp/best_collision_model.pth
 ├── scripts/
 │   ├── check_artifacts.py
 │   ├── run_experiment.sh
+│   ├── run_experiment_two_gpus.sh
 │   ├── run_table_two_gpus.sh
 │   ├── run_rqvae_pretrain.sh
 │   ├── rqvae/
@@ -147,6 +151,37 @@ bash scripts/run_experiment.sh beauty frqud
 bash scripts/run_experiment.sh instruments sdud
 bash scripts/run_experiment.sh yelp both
 ```
+
+### Two-GPU Low-Memory Preview
+
+For two 24 GB GPUs, use the low-memory launcher:
+
+```bash
+GPU=0,1 bash scripts/run_experiment_two_gpus.sh beauty sdud
+```
+
+It uses an evaluation batch size of 4 to limit beam-search memory and a per-device training batch size of 32 with four gradient-accumulation steps, so the effective training batch size matches the paper:
+
+```text
+32 per device x 2 processes x 4 accumulation steps = 256
+```
+
+The launcher starts one two-process DDP job, enables T5 gradient checkpointing, keeps optimizer and scheduler updates on real accumulation boundaries, and synchronizes Sinkhorn and quantizer statistics across processes. The startup log prints `per_device=32, processes=2, accumulation=4, effective=256` and `global_forward_batch=256`.
+
+The completed Beauty SDUD preview run obtained **R@5 = 0.043375**. The corresponding paper result is `0.044180`, an absolute difference of `0.000805` and a relative difference of `1.82%`. This is a usable low-memory baseline, but it is not yet an exact reproduction of the paper's single-GPU result.
+
+For traceability, that verified run used the Beauty checkpoint from the initial public release. It is packaged separately as `rqvae_ckpt/beauty/best_collision_model_two_gpu_preview.pth` and selected automatically only by the `beauty sdud` two-GPU command. The normal single-GPU launcher continues to use `rqvae_ckpt/beauty/best_collision_model.pth` and is unchanged.
+
+> **TODO:** finish full-run parity testing with the current paper checkpoint and validate every dataset/variant. At present, only Beauty SDUD has completed a full two-GPU low-memory run.
+
+To override the low-memory defaults while keeping the same launcher:
+
+```bash
+GPU=0,1 TRAIN_BATCH_SIZE=64 GRADIENT_ACCUMULATION_STEPS=2 EVAL_BATCH_SIZE=4 \
+  bash scripts/run_experiment_two_gpus.sh beauty sdud
+```
+
+Keep `per-device batch x GPU count x accumulation steps` equal to 256 when comparing with the released learning rates. For example, `64 x 2 x 4` is an effective batch size of 512 and is not equivalent to the paper setup.
 
 If you keep the paper environment outside your current shell, point the script at its `bin` directory:
 

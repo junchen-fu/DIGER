@@ -38,7 +38,13 @@ if (( ${#_gpu_arr[@]} == 2 )); then
 else
   GPU="${_gpu_arr[0]}"
 fi
-ACCEL_CFG="${ACCEL_CFG:-accelerate_config.yaml}"
+if [[ -n "${ACCEL_CFG:-}" ]]; then
+  ACCEL_CFG="${ACCEL_CFG}"
+elif (( ${#_gpu_arr[@]} == 2 )); then
+  ACCEL_CFG="accelerate_config_multi_gpu.yaml"
+else
+  ACCEL_CFG="accelerate_config.yaml"
+fi
 CONFIG="config/${DATASET}_jo.yaml"
 ACCELERATE_BIN="${ACCELERATE_BIN:-accelerate}"
 
@@ -57,7 +63,7 @@ fi
 
 COMMON_ARGS=(
   --config "${CONFIG}"
-  --rqvae_path="./rqvae_ckpt/${DATASET}/best_collision_model.pth"
+  --rqvae_path="${RQVAE_PATH:-./rqvae_ckpt/${DATASET}/best_collision_model.pth}"
   --lr_rec=0.001
   --lr_id=0.00001
   --weight_decay=0.05
@@ -76,15 +82,28 @@ COMMON_ARGS=(
   --use_gate_network=false
 )
 
+if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
+  COMMON_ARGS+=(--batch_size="${TRAIN_BATCH_SIZE}")
+fi
+if [[ -n "${GRADIENT_ACCUMULATION_STEPS:-}" ]]; then
+  COMMON_ARGS+=(--gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}")
+fi
+if [[ -n "${GRADIENT_CHECKPOINTING:-}" ]]; then
+  COMMON_ARGS+=(--gradient_checkpointing="${GRADIENT_CHECKPOINTING}")
+fi
+if [[ -n "${LOG_DIR:-}" ]]; then
+  COMMON_ARGS+=(--log_dir="${LOG_DIR}")
+fi
+
 case "${DATASET}" in
   beauty)
-    COMMON_ARGS+=(--epochs=120 --early_stop=15 --eval_batch_size=32 --num_beams=20 --gumbel_tau=2)
+    COMMON_ARGS+=(--epochs=120 --early_stop=15 --eval_batch_size="${EVAL_BATCH_SIZE:-32}" --num_beams=20 --gumbel_tau=2)
     ;;
   instruments)
-    COMMON_ARGS+=(--epochs=100 --early_stop=15 --eval_batch_size=32 --num_beams=20 --gumbel_tau=2)
+    COMMON_ARGS+=(--epochs=100 --early_stop=15 --eval_batch_size="${EVAL_BATCH_SIZE:-32}" --num_beams=20 --gumbel_tau=2)
     ;;
   yelp)
-    COMMON_ARGS+=(--epochs=200 --early_stop=20 --eval_batch_size=16 --num_beams=80 --gumbel_tau=1.5)
+    COMMON_ARGS+=(--epochs=200 --early_stop=20 --eval_batch_size="${EVAL_BATCH_SIZE:-16}" --num_beams=80 --gumbel_tau=1.5)
     ;;
   *)
     echo "Unknown dataset: ${DATASET}" >&2
@@ -126,12 +145,14 @@ case "${DATASET}:${VARIANT}" in
     ;;
 esac
 
-mkdir -p reproduction_logs
+REPRODUCTION_LOG_DIR="${REPRODUCTION_LOG_DIR:-reproduction_logs}"
+mkdir -p "${REPRODUCTION_LOG_DIR}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-OUT_LOG="reproduction_logs/${DATASET}_${VARIANT}_${STAMP}.log"
+OUT_LOG="${REPRODUCTION_LOG_DIR}/${DATASET}_${VARIANT}_${STAMP}.log"
 
 echo "Running ${DATASET}:${VARIANT} on GPU ${GPU}"
 echo "stdout log: ${OUT_LOG}"
 echo "accelerate: ${ACCELERATE_BIN}"
+echo "accelerate config: ${ACCEL_CFG}"
 
 CUDA_VISIBLE_DEVICES="${GPU}" "${ACCELERATE_BIN}" launch --config_file "${ACCEL_CFG}" main.py "${COMMON_ARGS[@]}" "${RUN_ARGS[@]}" 2>&1 | tee "${OUT_LOG}"

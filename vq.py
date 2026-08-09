@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from layers import *
 
 
@@ -356,7 +357,7 @@ class RQVAE(nn.Module):
         tau = max(self.tau_anneal_min, tau)
         return tau
 
-    def forward(self, x, use_gumbel=False, current_epoch=0, global_step=0):
+    def forward(self, x, use_gumbel=False, current_epoch=0, global_step=0, return_latent=False):
                                                                          
                                                                                  
                                                                                         
@@ -373,7 +374,10 @@ class RQVAE(nn.Module):
             current_epoch=current_epoch
         )
 
-        return x_q, rq_loss, indices, code_one_hot, logit, balance_loss, gate_reg_loss, mean_sigma
+        outputs = (x_q, rq_loss, indices, code_one_hot, logit, balance_loss, gate_reg_loss, mean_sigma)
+        if return_latent:
+            return outputs + (latent,)
+        return outputs
 
     @torch.no_grad()
     def get_indices(self, xs, use_sinkhorn=True):
@@ -591,6 +595,7 @@ class VectorQuantizer(nn.Module):
         self.kmeans_iters = config['kmeans_iters']
         self.sk_epsilon = sk_epsilon
         self.sk_iters = config.get('sk_iters', 50)           
+        self.sync_quantizer_stats = config.get('sync_quantizer_stats', True)
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
                                                                       
                                                         
@@ -669,6 +674,54 @@ class VectorQuantizer(nn.Module):
 
     def get_codebook(self):
         return self.embedding.weight
+
+    def _distributed_training_enabled(self):
+        return (
+            self.training
+            and self.sync_quantizer_stats
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        )
+
+    def _gather_detached_rows(self, tensor):
+        local_size = torch.tensor([tensor.shape[0]], device=tensor.device, dtype=torch.long)
+        all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
+        dist.all_gather(all_sizes, local_size)
+        sizes = [int(size.item()) for size in all_sizes]
+        max_size = max(sizes)
+
+        padded = tensor.detach()
+        if tensor.shape[0] < max_size:
+            padding = torch.zeros(
+                max_size - tensor.shape[0], *tensor.shape[1:],
+                device=tensor.device, dtype=tensor.dtype
+            )
+            padded = torch.cat([padded, padding], dim=0)
+
+        gathered = [torch.empty_like(padded) for _ in sizes]
+        dist.all_gather(gathered, padded)
+        rows = torch.cat([part[:size] for part, size in zip(gathered, sizes)], dim=0)
+        offset = sum(sizes[:dist.get_rank()])
+        return rows, offset
+
+    def _distributed_batch_mean(self, probabilities):
+        if not self._distributed_training_enabled():
+            return probabilities.mean(dim=0)
+
+        local_sum = probabilities.sum(dim=0)
+        global_sum = local_sum.detach().clone()
+        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+
+        total_count = torch.tensor(
+            float(probabilities.shape[0]), device=probabilities.device,
+            dtype=probabilities.dtype
+        )
+        dist.all_reduce(total_count, op=dist.ReduceOp.SUM)
+
+        global_mean = global_sum / total_count.clamp_min(1)
+        gradient_proxy = local_sum * (dist.get_world_size() / total_count.clamp_min(1))
+        return global_mean + gradient_proxy - gradient_proxy.detach()
 
     def get_codebook_entry(self, indices, shape=None):
                                       
@@ -848,9 +901,20 @@ class VectorQuantizer(nn.Module):
             should_use_sinkhorn = use_sinkhorn and self.sk_epsilon > 0
 
         if should_use_sinkhorn:
-            d = self.center_distance_for_constraint(d)
-            d = d.double()
-            Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
+            if self._distributed_training_enabled():
+                all_distances, local_offset = self._gather_detached_rows(d)
+                global_max = all_distances.max()
+                global_min = all_distances.min()
+                middle = (global_max + global_min) / 2
+                amplitude = (global_max - middle).clamp_min(1e-5)
+
+                d = ((d - middle) / amplitude).double()
+                sinkhorn_distances = (all_distances - middle) / amplitude
+                Q = sinkhorn_algorithm(sinkhorn_distances.double(), self.sk_epsilon, self.sk_iters)
+                Q = Q[local_offset:local_offset + latent.shape[0]]
+            else:
+                d = self.center_distance_for_constraint(d).double()
+                Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
 
             if torch.isnan(Q).any() or torch.isinf(Q).any():
                 print(f"Sinkhorn Algorithm returns nan/inf values.")
@@ -945,6 +1009,8 @@ class VectorQuantizer(nn.Module):
                                   
                 with torch.no_grad():
                     counts = torch.bincount(indices_deterministic.view(-1), minlength=self.n_e).float()
+                    if self._distributed_training_enabled():
+                        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
                     current_freq = counts / max(counts.sum(), 1)
                     self.code_usage_ema = self.usage_momentum * self.code_usage_ema + \
                                          (1 - self.usage_momentum) * current_freq
@@ -1083,7 +1149,7 @@ class VectorQuantizer(nn.Module):
                                                  
                                                                                 
                                                                                 
-            avg_probs = Ind_soft.mean(dim=0)         
+            avg_probs = self._distributed_batch_mean(Ind_soft)
 
                                                                 
             uniform_dist = torch.ones_like(avg_probs) / self.n_e
@@ -1127,7 +1193,7 @@ class VectorQuantizer(nn.Module):
                                                                          
                                                                              
                 Ind_soft_for_balance = F.softmax(logits / tau, dim=-1)
-                avg_probs = Ind_soft_for_balance.mean(dim=0)
+                avg_probs = self._distributed_batch_mean(Ind_soft_for_balance)
                 uniform_dist = torch.ones_like(avg_probs) / self.n_e
                 balance_loss = torch.abs(avg_probs - uniform_dist).sum()
             else:
