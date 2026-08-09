@@ -155,7 +155,7 @@ bash scripts/run_experiment.sh yelp both
 ### Two-GPU Low-Memory (Preview)
 
 > [!WARNING]
-> **Not an exact paper reproduction yet.** The verified Beauty SDUD run reached **R@5 = 0.043375**, versus **0.044180** in the paper (**-1.82%**). Other datasets and strategies remain TODO.
+> **Not an exact paper reproduction yet.** The verified Beauty SDUD run reached **R@5 = 0.043375**, versus **0.044180** in the paper (**-1.82%**). Full parity with the paper result remains TODO.
 
 For two 24 GB GPUs:
 
