@@ -1,20 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 from transformers import GenerationMixin
-from torch import nn
-from typing import Optional
 from dataclasses import dataclass
 from transformers.modeling_outputs import ModelOutput
-from vq import RQVAE
-from layers import *
+from layers import MLPLayers
 
 
 @dataclass
 class QuantizeOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
+    suffix_logits: Optional[torch.FloatTensor] = None
+    position_logits: Optional[Tuple[torch.FloatTensor, ...]] = None
     rank_logits: Optional[torch.FloatTensor] = None
     seq_latents: Optional[torch.FloatTensor] = None
     seq_project_latents: Optional[torch.FloatTensor] = None
@@ -46,7 +44,11 @@ class Model(nn.Module, GenerationMixin):
         self.semantic_embedding = nn.Embedding(self.n_items, self.semantic_hidden_size)
         self.semantic_embedding.requires_grad_(False)
         
-        self.token_embeddings = nn.ModuleList([nn.Embedding(self.code_number, self.hidden_size) for i in range(self.code_length)])
+        token_vocab_sizes = [self.code_number] * self.code_length
+        self.token_embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size, self.hidden_size)
+            for vocab_size in token_vocab_sizes
+        ])
         self.token_embeddings.requires_grad_(True)
         
         enc_adapter_layers = config['layers']
@@ -98,6 +100,112 @@ class Model(nn.Module, GenerationMixin):
         inputs_embeds = inputs_embeds.view(input_ids.shape[0], -1, self.hidden_size)
 
         return inputs_embeds
+
+    def get_mixture_input_embeddings(
+        self, semantic_probabilities, suffix_ids, attention_mask
+    ):
+        """Build item-major history embeddings without integer semantic IDs."""
+        if semantic_probabilities.dim() != 4:
+            raise ValueError(
+                "semantic_probabilities must have shape [batch, history, level, code]"
+            )
+        batch_size, history_length, semantic_levels, code_number = (
+            semantic_probabilities.shape
+        )
+        if semantic_levels != self.code_length - 1:
+            raise ValueError(
+                f"expected {self.code_length - 1} semantic levels, got {semantic_levels}"
+            )
+        if suffix_ids.shape != (batch_size, history_length):
+            raise ValueError("suffix_ids must match the batch/history dimensions")
+        if attention_mask.shape != (batch_size, history_length):
+            raise ValueError("attention_mask must match the batch/history dimensions")
+
+        item_embeddings = []
+        for level in range(semantic_levels):
+            if code_number != self.token_embeddings[level].num_embeddings:
+                raise ValueError("assignment and recommender codebook sizes differ")
+            item_embeddings.append(
+                torch.matmul(
+                    semantic_probabilities[:, :, level],
+                    self.token_embeddings[level].weight,
+                )
+            )
+        item_embeddings.append(
+            self.token_embeddings[-1](suffix_ids.clamp_min(0))
+        )
+        inputs_embeds = torch.stack(item_embeddings, dim=2).reshape(
+            batch_size, history_length * self.code_length, self.hidden_size
+        )
+        expanded_attention_mask = attention_mask.unsqueeze(-1).expand(
+            batch_size, history_length, self.code_length
+        ).reshape(batch_size, history_length * self.code_length)
+        pad_embedding = self.model.shared.weight[0].view(1, 1, -1)
+        inputs_embeds = torch.where(
+            expanded_attention_mask.unsqueeze(-1), inputs_embeds, pad_embedding
+        )
+        return inputs_embeds, expanded_attention_mask
+
+    def get_differentiable_decoder_inputs(self, target_probabilities):
+        """Teacher-force with target mixtures instead of detached argmax IDs."""
+        if target_probabilities.dim() != 3:
+            raise ValueError(
+                "target_probabilities must have shape [batch, level, code]"
+            )
+        if target_probabilities.shape[1] != self.code_length - 1:
+            raise ValueError(
+                f"expected {self.code_length - 1} target levels"
+            )
+        batch_size = target_probabilities.shape[0]
+        start_ids = torch.full(
+            (batch_size,),
+            self.config.decoder_start_token_id,
+            dtype=torch.long,
+            device=target_probabilities.device,
+        )
+        decoder_embeddings = [self.model.shared(start_ids)]
+        for level in range(self.code_length - 1):
+            decoder_embeddings.append(
+                torch.matmul(
+                    target_probabilities[:, level],
+                    self.token_embeddings[level].weight,
+                )
+            )
+        return torch.stack(decoder_embeddings, dim=1)
+
+    def compute_differentiable_code_losses(
+        self, logits, target_probabilities, suffix_ids, suffix_logits=None
+    ):
+        """Return semantic and hard-suffix contributions on the old CE scale."""
+        semantic_levels = self.code_length - 1
+        if suffix_logits is None:
+            if logits.shape[1] != self.code_length:
+                raise ValueError("recommender logits must contain every code position")
+            semantic_logits = logits[:, :semantic_levels]
+            suffix_logits = logits[:, semantic_levels]
+        else:
+            if logits.shape[1] == self.code_length:
+                semantic_logits = logits[:, :semantic_levels]
+            elif logits.shape[1] == semantic_levels:
+                semantic_logits = logits
+            else:
+                raise ValueError("semantic logits must contain every RQ position")
+        if target_probabilities.shape[:2] != (
+            logits.shape[0], semantic_levels
+        ):
+            raise ValueError("target probabilities do not match recommender logits")
+        semantic_nll = -(
+            target_probabilities
+            * F.log_softmax(semantic_logits.float(), dim=-1)
+        ).sum(dim=-1)
+        denominator = logits.shape[0] * self.code_length
+        semantic_loss = semantic_nll.sum() / denominator
+        suffix_loss = F.cross_entropy(
+            suffix_logits.float(),
+            suffix_ids.detach().long(),
+            reduction="sum",
+        ) / denominator
+        return semantic_loss, suffix_loss
     
     def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, labels=None, decoder_input_ids=None,
                 decoder_inputs_embeds=None, encoder_outputs=None, quantizer_latent=None,
@@ -106,12 +214,14 @@ class Model(nn.Module, GenerationMixin):
         if input_ids is not None:
             inputs_embeds = self.get_input_embeddings(input_ids, attention_mask)
 
-        if decoder_input_ids is None and labels is None:
-            decoder_input_ids = torch.zeros(input_ids.size(0), self.code_length).long().to(input_ids.device)
-        elif decoder_input_ids is None and labels is not None:
-            decoder_input_ids = self._shift_right(labels)
+        if decoder_inputs_embeds is None:
+            if decoder_input_ids is None and labels is None:
+                decoder_input_ids = torch.zeros(
+                    input_ids.size(0), self.code_length
+                ).long().to(input_ids.device)
+            elif decoder_input_ids is None and labels is not None:
+                decoder_input_ids = self._shift_right(labels)
 
-        if decoder_inputs_embeds is None and decoder_input_ids is not None:
             decoder_inputs_embeds = []
             for i in range(min(decoder_input_ids.shape[1], self.code_length)):
                 if i==0:
@@ -137,7 +247,13 @@ class Model(nn.Module, GenerationMixin):
             centroid = self.token_embeddings[i].weight.t()
             code_logits.append(torch.matmul(decoder_outputs[:, i], centroid))
         
-        code_logits = torch.stack(code_logits, dim=1)                              
+        position_logits = tuple(code_logits)
+        stacked_logits = torch.stack(position_logits, dim=1)
+        suffix_logits = (
+            stacked_logits[:, -1]
+            if len(position_logits) == self.code_length
+            else None
+        )
         
         seq_latents = model_outputs.encoder_last_hidden_state.clone()
                       
@@ -160,7 +276,9 @@ class Model(nn.Module, GenerationMixin):
                 qs_beta * F.mse_loss(z_projected.detach(), token_embs)
         
         outputs = QuantizeOutput(
-            logits=code_logits,
+            logits=stacked_logits,
+            suffix_logits=suffix_logits,
+            position_logits=position_logits,
             seq_latents=seq_last_latents,
             seq_project_latents=seq_project_latents,
             dec_latents=dec_latents,
@@ -230,7 +348,7 @@ class Model(nn.Module, GenerationMixin):
                 )
 
             decoder_input_ids, beam_scores = self.beam_search_step(
-                outputs.logits,
+                outputs.position_logits[-1].unsqueeze(1),
                 decoder_input_ids,
                 beam_scores,
                 beam_idx_offset,

@@ -167,12 +167,29 @@ def train(config, verbose=True, rank=0):
         logger,
     )
 
-    best_score = trainer.train(verbose=verbose)
-    test_results = trainer.test()
+    try:
+        best_score = trainer.train(verbose=verbose)
+    except Exception as error:
+        trainer._update_manifest(
+            status='failed',
+            stop_reason=f'{type(error).__name__}: {error}',
+        )
+        raise
+    if config.get('evaluate_test_at_end', True):
+        test_results = getattr(trainer, 'final_test_results', None)
+        if test_results is None:
+            test_results = getattr(trainer, 'stage1_test_results', None)
+        if test_results is None:
+            test_results = trainer.test()
+    else:
+        test_results = None
 
     if accelerator.is_main_process:
         log(f"Best Validation Score: {best_score}", accelerator, logger)
-        log(f"Test Results: {test_results}", accelerator, logger)
+        if test_results is not None:
+            log(f"Test Results: {test_results}", accelerator, logger)
+        else:
+            log("Test evaluation disabled; evaluate the validation-selected checkpoint separately.", accelerator, logger)
     accelerator.end_training()
 
 
@@ -186,6 +203,7 @@ if __name__=="__main__":
     config.update(command_line_configs)
 
     config = convert_config_dict(config)
+    config['config_path'] = os.path.abspath(args.config)
     gradient_accumulation_steps = int(config.get('gradient_accumulation_steps', 1))
     if gradient_accumulation_steps < 1:
         raise ValueError('gradient_accumulation_steps must be at least 1')

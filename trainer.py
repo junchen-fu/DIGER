@@ -1,4 +1,10 @@
 import os
+import hashlib
+import random
+import signal
+import subprocess
+import sys
+import tempfile
 import torch
 import numpy as np
 import torch.distributed as dist
@@ -11,6 +17,7 @@ import json
 import math
 import contextlib
 from itertools import islice
+from dataclasses import dataclass
 from colorama import init
 from utils import ensure_dir, set_color, get_local_time
 from accelerate import PartialState
@@ -19,10 +26,230 @@ from transformers import get_linear_schedule_with_warmup, get_constant_schedule_
 from transformers.optimization import get_scheduler
 from metrics import *
 from utils import *
-from vq import AutoSigmaGumbel, AutoSigmaGaussian, AutoSigmaSimple
+from vq import (
+    AutoSigmaGumbel,
+    AutoSigmaGaussian,
+    AutoSigmaSimple,
+    TRUE_E2E_ASSIGNMENT_MODES,
+)
 from collections import defaultdict
 from logging import getLogger
 init(autoreset=True)
+
+
+TRAINING_CHECKPOINT_VERSION = 1
+_RESUME_RUNTIME_CONFIG_KEYS = {
+    'accelerator',
+    'config_path',
+    'device',
+    'evaluate_test_at_end',
+    'allow_resume_code_mismatch',
+    'allow_resume_config_mismatch',
+    'resume_from',
+    'run_local_time',
+    'save_path',
+    'stop_after_epoch',
+    'use_ddp',
+}
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def resumable_config_snapshot(config):
+    return _json_safe({
+        key: value
+        for key, value in config.items()
+        if key not in _RESUME_RUNTIME_CONFIG_KEYS
+    })
+
+
+def resumable_config_fingerprint(config):
+    payload = json.dumps(
+        resumable_config_snapshot(config), sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+def semantic_id_map_sha256(item_codes):
+    """Return a stable hash for a complete integer SID map."""
+    array = np.asarray(item_codes, dtype=np.int64)
+    return hashlib.sha256(array.tobytes(order='C')).hexdigest()
+
+
+def semantic_id_change_stats(previous_codes, current_codes, prefix_length):
+    """Measure item-level SID changes, excluding the padding row."""
+    previous = np.asarray(previous_codes, dtype=np.int64)
+    current = np.asarray(current_codes, dtype=np.int64)
+    if previous.shape != current.shape:
+        raise ValueError(
+            f'SID map shapes differ: {previous.shape} vs {current.shape}'
+        )
+    if previous.ndim != 2:
+        raise ValueError('SID maps must be rank-2')
+    if not 0 < int(prefix_length) < previous.shape[1]:
+        raise ValueError('prefix_length must leave at least one suffix column')
+
+    previous = previous[1:]
+    current = current[1:]
+    item_count = int(current.shape[0])
+
+    def _rate(mask):
+        changed = int(np.count_nonzero(mask))
+        return {
+            'changed_items': changed,
+            'change_rate': changed / max(item_count, 1),
+        }
+
+    prefix_changed = np.any(
+        previous[:, :prefix_length] != current[:, :prefix_length], axis=1
+    )
+    full_changed = np.any(previous != current, axis=1)
+    suffix_changed = previous[:, prefix_length] != current[:, prefix_length]
+    per_level = []
+    for level_index in range(prefix_length):
+        level = _rate(previous[:, level_index] != current[:, level_index])
+        level['level'] = level_index + 1
+        per_level.append(level)
+    return {
+        'item_count': item_count,
+        'full': _rate(full_changed),
+        'prefix': _rate(prefix_changed),
+        'suffix': _rate(suffix_changed),
+        'per_level': per_level,
+    }
+
+
+def capture_rng_state():
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch_cpu': torch.get_rng_state(),
+        'torch_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng_state(state):
+    required = {'python', 'numpy', 'torch_cpu', 'torch_cuda'}
+    missing = required.difference(state)
+    if missing:
+        raise ValueError(f'RNG checkpoint is missing fields: {sorted(missing)}')
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch_cpu'])
+    cuda_states = state['torch_cuda']
+    if cuda_states:
+        if not torch.cuda.is_available():
+            raise RuntimeError('CUDA RNG state cannot be restored without CUDA')
+        if len(cuda_states) != torch.cuda.device_count():
+            raise RuntimeError(
+                'CUDA RNG device count mismatch: '
+                f'{len(cuda_states)} in checkpoint vs {torch.cuda.device_count()} visible'
+            )
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def atomic_torch_save(payload, path):
+    path = os.path.abspath(os.fspath(path))
+    ensure_dir(os.path.dirname(path))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=os.path.basename(path) + '.', suffix='.tmp',
+            dir=os.path.dirname(path), delete=False,
+        ) as file_obj:
+            temporary = file_obj.name
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def atomic_json_save(payload, path):
+    path = os.path.abspath(os.fspath(path))
+    ensure_dir(os.path.dirname(path))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8',
+            prefix=os.path.basename(path) + '.', suffix='.tmp',
+            dir=os.path.dirname(path), delete=False,
+        ) as file_obj:
+            temporary = file_obj.name
+            json.dump(_json_safe(payload), file_obj, indent=2, sort_keys=True)
+            file_obj.write('\n')
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@dataclass
+class BatchItemIndex:
+    unique_item_ids: torch.Tensor
+    history_inverse: torch.Tensor
+    target_inverse: torch.Tensor
+
+
+def deduplicate_batch_items(input_ids, attention_mask, targets, padding_id=0):
+    """Deduplicate valid history and target items for one local forward batch."""
+    if input_ids.shape != attention_mask.shape:
+        raise ValueError("input_ids and attention_mask must have the same shape")
+    valid_history_mask = attention_mask.bool() & input_ids.ne(padding_id)
+    valid_history = input_ids[valid_history_mask]
+    flat_targets = targets.reshape(-1)
+    if flat_targets.eq(padding_id).any():
+        raise ValueError("padding items cannot be recommendation targets")
+
+    combined = torch.cat([valid_history, flat_targets], dim=0)
+    unique_item_ids, inverse = torch.unique(
+        combined, sorted=True, return_inverse=True
+    )
+    history_inverse = torch.full_like(input_ids, -1)
+    history_inverse[valid_history_mask] = inverse[:valid_history.numel()]
+    target_inverse = inverse[valid_history.numel():].view_as(targets)
+    return BatchItemIndex(
+        unique_item_ids=unique_item_ids,
+        history_inverse=history_inverse,
+        target_inverse=target_inverse,
+    )
+
+
+def cached_hard_straight_through(current_soft, cached_hard_ids):
+    """Use cached hard semantic IDs in forward and current assignments in backward."""
+    if current_soft.dim() != cached_hard_ids.dim() + 1:
+        raise ValueError(
+            "current_soft must have exactly one code dimension beyond cached_hard_ids"
+        )
+    if current_soft.shape[:-1] != cached_hard_ids.shape:
+        raise ValueError("cached hard IDs must match the item and RQ-layer dimensions")
+    if not current_soft.is_floating_point():
+        raise TypeError("current_soft must be a floating-point probability tensor")
+    code_number = current_soft.shape[-1]
+    cached_hard_ids = cached_hard_ids.detach().long()
+    if cached_hard_ids.numel() and (
+        cached_hard_ids.min().item() < 0
+        or cached_hard_ids.max().item() >= code_number
+    ):
+        raise ValueError("cached semantic IDs must be valid non-padding code indices")
+    cached_one_hot = F.one_hot(
+        cached_hard_ids, num_classes=code_number
+    ).to(dtype=current_soft.dtype, device=current_soft.device)
+    return cached_one_hot - current_soft.detach() + current_soft
 
 
 def accumulation_windows(iterable, window_size):
@@ -68,11 +295,47 @@ class Trainer(object):
         self.state = PartialState()
         self.world_size = self.state.num_processes
         self.device = self.state.device
+        self.training_mode = config.get('training_mode', 'alternating_baseline')
+        supported_training_modes = {'alternating_baseline'} | TRUE_E2E_ASSIGNMENT_MODES
+        if self.training_mode not in supported_training_modes:
+            raise ValueError(f'Unsupported training_mode: {self.training_mode}')
+        self.is_true_e2e = self.training_mode in TRUE_E2E_ASSIGNMENT_MODES
+        if self.is_true_e2e:
+            if self.world_size != 1:
+                raise ValueError('True-E2E modes are intentionally single-process only')
+            if self.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    'True-E2E modes currently require gradient_accumulation_steps=1'
+                )
+            if self.code_length != len(config['num_emb_list']) + 1:
+                raise ValueError(
+                    'True-E2E modes require one collision suffix after the RQ levels'
+                )
+            if self.training_mode != 'true_e2e_plain':
+                if float(config.get('gumbel_noise_scale', 1.0)) < 0:
+                    raise ValueError('gumbel_noise_scale must be non-negative')
+            if 'sdud' in self.training_mode:
+                if not config.get('use_learnable_sigma_gumbel', False):
+                    raise ValueError('SDUD modes require use_learnable_sigma_gumbel=true')
+                if not config.get('use_simple_uncertainty_loss', False):
+                    raise ValueError('SDUD modes require direct learnable noise scale')
+                if float(config.get('sigma_lambda', 0.0)) <= 0:
+                    raise ValueError('SDUD modes require positive sigma_lambda')
+
         self.all_item_code = None
         self.model_rec.device = self.device
 
                                                       
         self.global_step = 0
+        self.stop_requested = False
+        self.stop_request_reason = None
+        self.last_validation_metrics = None
+        self.last_codebook_stats = None
+        self.last_assignment_stats = None
+        self.last_rec_gradient_report = None
+        self.manifest_path = os.path.join(self.save_path, 'manifest.json')
+        if self.is_true_e2e and hasattr(signal, 'SIGUSR1'):
+            signal.signal(signal.SIGUSR1, self._request_graceful_stop)
 
         self.all_metrics = config["metrics"].split(",")
         self.valid_metric = config["valid_metric"]
@@ -83,6 +346,11 @@ class Trainer(object):
             self.max_topk = max(self.max_topk, int(top_k))
             if m_name.lower() not in self.all_metric_name:
                 self.all_metric_name.append(m_name.lower())
+        if int(config['num_beams']) < self.max_topk:
+            raise ValueError(
+                f'num_beams={config["num_beams"]} is smaller than the largest '
+                f'requested metric cutoff {self.max_topk}'
+            )
 
         self.train_data = train_data
         self.valid_data = valid_data
@@ -112,6 +380,7 @@ class Trainer(object):
 
         self.best_score = 0
         self.best_ckpt = None
+        self.best_epoch = None
 
         self.model_rec, self.rec_optimizer, self.rec_lr_scheduler, \
         self.model_id, self.train_data, self.valid_data, self.test_data = \
@@ -119,13 +388,22 @@ class Trainer(object):
                                  self.model_id, self.train_data, self.valid_data, self.test_data)
         self.process_seed = init_device_seed(config['seed'], self.accelerator.process_index)
 
+    def _request_graceful_stop(self, signum, frame):
+        del frame
+        self.stop_requested = True
+        self.stop_request_reason = f'signal_{signal.Signals(signum).name.lower()}'
+
     def _configure_trainable_parameters(self, model_rec, model_id):
         for param in model_rec.parameters():
             param.requires_grad = True
         if self.config.get('freeze_semantic_embedding', True):
             model_rec.semantic_embedding.requires_grad_(False)
 
-        if not self.config.get('end_to_end', False):
+        trains_tokenizer = (
+            self.config.get('end_to_end', False)
+            or self.config.get('training_mode') in TRUE_E2E_ASSIGNMENT_MODES
+        )
+        if not trains_tokenizer:
             model_id.requires_grad_(False)
             return
 
@@ -158,14 +436,11 @@ class Trainer(object):
         return total_params, trainable_params
 
     def _count_module_parameters(self, model, module_name):
-        try:
-            module = getattr(model, module_name, None)
-            if module is not None:
-                total = sum(p.numel() for p in module.parameters())
-                trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-                self.log(f"  {module_name}: Total={total:,}, Trainable={trainable:,}")
-        except:
-            pass
+        module = getattr(model, module_name, None)
+        if module is not None:
+            total = sum(p.numel() for p in module.parameters())
+            trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            self.log(f"  {module_name}: Total={total:,}, Trainable={trainable:,}")
 
     def _build_optimizer(self, model, lr, weight_decay):
         params = model.parameters()
@@ -556,6 +831,354 @@ class Trainer(object):
         self.accelerator.wait_for_everyone()
         return total_loss
 
+    @staticmethod
+    def _combined_gradient_norm(gradients):
+        squared_norm = 0.0
+        for gradient in gradients:
+            if gradient is not None:
+                squared_norm += gradient.detach().float().pow(2).sum().item()
+        return math.sqrt(squared_norm)
+
+    def _recommendation_gradient_report(self, semantic_loss, tokenizer_output):
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        encoder_parameters = [
+            parameter for parameter in model_id.encoder.parameters()
+            if parameter.requires_grad
+        ]
+        codebook_parameters = [
+            quantizer.embedding.weight for quantizer in model_id.rq.vq_layers
+            if quantizer.embedding.weight.requires_grad
+        ]
+        assignment_logits = [
+            level.assignment_logits for level in tokenizer_output.levels
+        ]
+        requested = encoder_parameters + codebook_parameters + assignment_logits
+        gradients = torch.autograd.grad(
+            semantic_loss,
+            requested,
+            retain_graph=True,
+            allow_unused=True,
+        )
+
+        encoder_end = len(encoder_parameters)
+        codebook_end = encoder_end + len(codebook_parameters)
+        report = {
+            'encoder': self._combined_gradient_norm(gradients[:encoder_end]),
+            'codebooks': [
+                self._combined_gradient_norm([gradient])
+                for gradient in gradients[encoder_end:codebook_end]
+            ],
+            'assignments': [
+                self._combined_gradient_norm([gradient])
+                for gradient in gradients[codebook_end:]
+            ],
+        }
+        required = report['codebooks'] + report['assignments']
+        if encoder_parameters:
+            required = [report['encoder']] + required
+        if any(not math.isfinite(value) or value <= 1e-10 for value in required):
+            raise RuntimeError(
+                f'recommendation-only gradient contract failed: {report}'
+            )
+        self.last_rec_gradient_report = report
+        return report
+
+    @staticmethod
+    def _true_e2e_semantic_loss(raw_semantic_loss):
+        """UD changes assignment noise, never recommendation-loss scale."""
+        return raw_semantic_loss
+
+    def _train_epoch_true_e2e(self, epoch_idx, verbose=True):
+        """Minimal single-process True-E2E assignment training."""
+        if not hasattr(self, 'id_optimizer'):
+            raise RuntimeError('True-E2E training requires a tokenizer optimizer')
+        self.model_rec.train()
+        self.model_id.train()
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        model_id.reset_adaptive_selection_stats()
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        total_num = 0
+        total_loss = defaultdict(float)
+        iterator = tqdm(
+            self.train_data,
+            total=len(self.train_data),
+            ncols=100,
+            desc=set_color(f'True-E2E {epoch_idx}', 'pink'),
+            disable=(not verbose) or (not self.accelerator.is_main_process),
+        )
+        assignment_forward = self.config.get('assignment_forward', 'hard_st')
+        if assignment_forward not in {'hard_st', 'soft'}:
+            raise ValueError(
+                f'Unsupported assignment_forward: {assignment_forward}'
+            )
+        for batch_idx, batch in enumerate(iterator):
+            self.rec_optimizer.zero_grad()
+            self.id_optimizer.zero_grad()
+
+            raw_input_ids = batch['input_ids'].to(self.device)
+            raw_attention_mask = batch['attention_mask'].to(self.device).bool()
+            targets = batch['targets'].to(self.device)
+            batch_index = deduplicate_batch_items(
+                raw_input_ids,
+                raw_attention_mask,
+                targets,
+                padding_id=self.pad_token_id,
+            )
+
+            unique_embeddings = model_rec.semantic_embedding(
+                batch_index.unique_item_ids
+            )
+            if self.config.get('use_tau_annealing', False):
+                assignment_temperature = model_id.get_current_tau(
+                    self.global_step
+                )
+            else:
+                assignment_temperature = float(
+                    self.config.get('assignment_temperature', 2.0)
+                )
+            tokenizer_output = self.model_id(
+                unique_embeddings,
+                current_epoch=epoch_idx,
+                global_step=self.global_step,
+                return_structured=True,
+                deterministic_st=self.training_mode == 'true_e2e_plain',
+                assignment_temperature=assignment_temperature,
+                assignment_mode=self.training_mode,
+                assignment_forward=assignment_forward,
+            )
+            current_soft_probabilities = torch.stack(
+                [level.soft_probabilities for level in tokenizer_output.levels],
+                dim=1,
+            )
+            sampled_forward_probabilities = torch.stack(
+                [
+                    level.forward_probabilities
+                    for level in tokenizer_output.levels
+                ],
+                dim=1,
+            )
+            cached_semantic_ids = self.all_item_code[
+                batch_index.unique_item_ids, :current_soft_probabilities.shape[1]
+            ].detach()
+            use_cached_sinkhorn_forward = bool(
+                self.config.get('use_cached_sinkhorn_forward', True)
+            )
+            if use_cached_sinkhorn_forward:
+                unique_probabilities = cached_hard_straight_through(
+                    current_soft_probabilities, cached_semantic_ids
+                )
+            else:
+                unique_probabilities = sampled_forward_probabilities
+            history_probabilities = unique_probabilities[
+                batch_index.history_inverse.clamp_min(0)
+            ]
+            target_probabilities = unique_probabilities[
+                batch_index.target_inverse
+            ].squeeze(1)
+
+            history_suffix = self.all_item_code[raw_input_ids, -1]
+            target_suffix = self.all_item_code[targets.reshape(-1), -1]
+            inputs_embeds, expanded_attention_mask = (
+                model_rec.get_mixture_input_embeddings(
+                    history_probabilities,
+                    history_suffix,
+                    raw_attention_mask,
+                )
+            )
+            decoder_inputs_embeds = model_rec.get_differentiable_decoder_inputs(
+                target_probabilities
+            )
+            outputs = self.model_rec(
+                inputs_embeds=inputs_embeds,
+                attention_mask=expanded_attention_mask,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+            )
+            raw_semantic_loss, suffix_loss = (
+                model_rec.compute_differentiable_code_losses(
+                    outputs.logits,
+                    target_probabilities,
+                    target_suffix,
+                    suffix_logits=outputs.suffix_logits,
+                )
+            )
+            semantic_loss = self._true_e2e_semantic_loss(raw_semantic_loss)
+            target_positions = batch_index.target_inverse.reshape(-1)
+            recon_loss_per_item = (
+                tokenizer_output.quantized - tokenizer_output.latent
+            ).pow(2).mean(dim=-1)
+            recon_loss = recon_loss_per_item[target_positions].mean()
+            vq_loss = tokenizer_output.vq_loss_per_item[
+                target_positions
+            ].mean()
+            code_loss_weight = float(self.config.get('code_loss_weight', 1.0))
+            recon_loss_weight = float(self.config.get('recon_loss_weight', 1.0))
+            vq_loss_weight = float(self.config.get('vq_loss_weight', 1.0))
+            loss = (
+                code_loss_weight * (semantic_loss + suffix_loss)
+                + recon_loss_weight * recon_loss
+                + vq_loss_weight * vq_loss
+            )
+
+            if batch_idx == 0:
+                self.log(
+                    '[Recommendation Forward] '
+                    f'assignment_forward={assignment_forward}, '
+                    f'cached_sinkhorn_forward={use_cached_sinkhorn_forward}, '
+                    f'temperature={assignment_temperature:.6f}'
+                )
+                gradient_report = self._recommendation_gradient_report(
+                    semantic_loss, tokenizer_output
+                )
+                self.log(
+                    '[Gradient Attribution] recommendation-only '
+                    f'encoder={gradient_report["encoder"]:.8e}, '
+                    f'codebooks={gradient_report["codebooks"]}, '
+                    f'assignments={gradient_report["assignments"]}'
+                )
+                sampled_hard_indices = torch.stack(
+                    [level.hard_indices.detach() for level in tokenizer_output.levels],
+                    dim=1,
+                )
+                raw_argmax_indices = torch.stack(
+                    [
+                        level.assignment_logits.detach().argmax(dim=-1)
+                        for level in tokenizer_output.levels
+                    ],
+                    dim=1,
+                )
+                train_forward_indices = unique_probabilities.detach().argmax(dim=-1)
+                sample_prefix_vs_cached = sampled_hard_indices.eq(
+                    cached_semantic_ids
+                ).all(dim=-1).float().mean().item()
+                train_prefix_vs_cached = train_forward_indices.eq(
+                    cached_semantic_ids
+                ).all(dim=-1).float().mean().item()
+                assignment_stats = []
+                for level_index, level in enumerate(tokenizer_output.levels):
+                    probabilities = level.soft_probabilities.detach().float()
+                    entropy = -(
+                        probabilities
+                        * probabilities.clamp_min(1e-12).log()
+                    ).sum(dim=-1).mean().item()
+                    max_probability = probabilities.max(dim=-1).values.mean().item()
+                    usage = torch.bincount(
+                        level.hard_indices.detach().reshape(-1),
+                        minlength=probabilities.shape[-1],
+                    )
+                    dead_codes = usage.eq(0).sum().item()
+                    sample_vs_raw_argmax = sampled_hard_indices[:, level_index].eq(
+                        raw_argmax_indices[:, level_index]
+                    ).float().mean().item()
+                    sample_vs_cached_sinkhorn = sampled_hard_indices[:, level_index].eq(
+                        cached_semantic_ids[:, level_index]
+                    ).float().mean().item()
+                    train_hard_vs_cached_sinkhorn = train_forward_indices[:, level_index].eq(
+                        cached_semantic_ids[:, level_index]
+                    ).float().mean().item()
+                    level_stats = {
+                        'level': level_index + 1,
+                        'entropy': entropy,
+                        'max_probability': max_probability,
+                        'used': int((usage > 0).sum().item()),
+                        'dead': int(dead_codes),
+                        'sample_vs_raw_argmax': sample_vs_raw_argmax,
+                        'sample_vs_cached_sinkhorn': sample_vs_cached_sinkhorn,
+                        'train_hard_vs_cached_sinkhorn': train_hard_vs_cached_sinkhorn,
+                        'sample_prefix_vs_cached_sinkhorn': sample_prefix_vs_cached,
+                        'train_prefix_vs_cached_sinkhorn': train_prefix_vs_cached,
+                        'temperature': float(assignment_temperature),
+                    }
+                    uncertainty_parts = []
+                    if level.noise_scale is not None:
+                        level_stats['noise_scale'] = (
+                            level.noise_scale.detach().float().mean().item()
+                        )
+                        uncertainty_parts.append(
+                            f'noise_scale={level_stats["noise_scale"]:.6f}'
+                        )
+                    if level.effective_noise_scale is not None:
+                        effective_scale = level.effective_noise_scale.detach().float()
+                        level_stats['effective_noise_mean'] = effective_scale.mean().item()
+                        uncertainty_parts.append(
+                            f'effective_noise_mean={level_stats["effective_noise_mean"]:.6f}'
+                        )
+                    if level.frequency_scores is not None:
+                        frequency = level.frequency_scores.detach().float()
+                        level_stats['frequency_mean'] = frequency.mean().item()
+                        uncertainty_parts.append(
+                            f'frequency_mean={level_stats["frequency_mean"]:.6f}'
+                        )
+                    if level.stochastic_mask is not None:
+                        level_stats['stochastic_ratio'] = (
+                            level.stochastic_mask.detach().float().mean().item()
+                        )
+                        uncertainty_parts.append(
+                            'stochastic_ratio='
+                            f'{level_stats["stochastic_ratio"]:.6f}'
+                        )
+                    assignment_stats.append(level_stats)
+                    self.log(
+                        f'[Assignment L{level_index}] entropy={entropy:.6f}, '
+                        f'max_probability={max_probability:.6f}, '
+                        f'used={(usage > 0).sum().item()}, dead={dead_codes}, '
+                        f'sample_vs_raw_argmax={sample_vs_raw_argmax:.6f}, '
+                        f'sample_vs_cached_sinkhorn={sample_vs_cached_sinkhorn:.6f}, '
+                        f'train_hard_vs_cached_sinkhorn={train_hard_vs_cached_sinkhorn:.6f}, '
+                        f'temperature={assignment_temperature:.6f}'
+                        + (
+                            ', ' + ', '.join(uncertainty_parts)
+                            if uncertainty_parts else ''
+                        )
+                    )
+                self.log(
+                    '[Assignment Prefix] '
+                    f'sample_vs_cached_sinkhorn={sample_prefix_vs_cached:.6f}, '
+                    f'train_hard_vs_cached_sinkhorn={train_prefix_vs_cached:.6f}'
+                )
+                self.last_assignment_stats = assignment_stats
+
+            self.accelerator.backward(loss)
+            self.accelerator.clip_grad_norm_(self.model_rec.parameters(), 1.0)
+            self.accelerator.clip_grad_norm_(self.model_id.parameters(), 1.0)
+            self.rec_optimizer.step()
+            self.id_optimizer.step()
+            self.rec_lr_scheduler.step()
+            self.id_lr_scheduler.step()
+            self.global_step += 1
+
+            values = {
+                'loss': loss.detach(),
+                'semantic_loss': semantic_loss.detach(),
+                'raw_semantic_loss': raw_semantic_loss.detach(),
+                'suffix_loss': suffix_loss.detach(),
+                'recon_loss': recon_loss.detach(),
+                'vq_loss': vq_loss.detach(),
+                'unique_items': torch.tensor(
+                    float(batch_index.unique_item_ids.numel()),
+                    device=self.device,
+                ),
+            }
+            for name, value in values.items():
+                total_loss[name] += value.float().item()
+            total_num += 1
+            iterator.set_postfix(loss=values['loss'].item())
+
+        if total_num == 0:
+            raise RuntimeError('True-E2E training received an empty training loader')
+        for name in total_loss:
+            total_loss[name] = round(total_loss[name] / total_num, 6)
+        if torch.cuda.is_available():
+            peak_memory_mb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+            total_loss['peak_memory_mb'] = round(peak_memory_mb, 2)
+            self.log(f'[Memory] peak allocated={peak_memory_mb:.2f} MiB')
+
+        self.accelerator.wait_for_everyone()
+        return dict(total_loss)
+
     def _train_epoch_rec(self, epoch_idx, loss_w, freeze_id=False, verbose=True):
 
         preserve_forward_batch = self.config.get('preserve_reference_forward_batch', True)
@@ -901,6 +1524,238 @@ class Trainer(object):
         last_checkpoint = f'{self.save_path}/{filename}.pt'
         return last_checkpoint
 
+    def _repo_metadata(self):
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+
+        def run_git(*arguments):
+            completed = subprocess.run(
+                ['git', *arguments], cwd=repo_root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False,
+            )
+            return completed.stdout if completed.returncode == 0 else b''
+
+        head = run_git('rev-parse', 'HEAD').decode('utf-8').strip() or None
+        status = run_git('status', '--short').decode('utf-8').splitlines()
+        diff = run_git('diff', '--binary', '--no-ext-diff')
+        return {
+            'repo_root': repo_root,
+            'git_head': head,
+            'git_status': status,
+            'git_diff_sha256': hashlib.sha256(diff).hexdigest(),
+        }
+
+    def _initialize_manifest(self, resume_from=None):
+        if not self.accelerator.is_main_process:
+            return
+        repo = self._repo_metadata()
+        manifest = {
+            'schema_version': 1,
+            'status': 'running',
+            'created_at': get_local_time(),
+            'updated_at': get_local_time(),
+            'dataset': self.config['dataset'],
+            'seed': int(self.config['seed']),
+            'save_path': os.path.abspath(self.save_path),
+            'config_path': self.config.get('config_path'),
+            'resolved_config': resumable_config_snapshot(self.config),
+            'config_fingerprint': resumable_config_fingerprint(self.config),
+            'command': [sys.executable, *sys.argv],
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+            'data_path': os.path.abspath(self.config['data_path']),
+            'initial_rqvae_checkpoint': self.config.get('rqvae_path'),
+            'resume_from': os.path.abspath(resume_from) if resume_from else None,
+            'best_epoch': self.best_epoch,
+            'best_validation': _json_safe(self.best_result),
+            'best_checkpoint': self.best_ckpt,
+            **repo,
+        }
+        atomic_json_save(manifest, self.manifest_path)
+
+    def _update_manifest(self, **updates):
+        if not self.accelerator.is_main_process:
+            return
+        manifest = {}
+        if os.path.isfile(self.manifest_path):
+            with open(self.manifest_path, 'r', encoding='utf-8') as file_obj:
+                manifest = json.load(file_obj)
+        safe_updates = _json_safe(updates)
+        for key, value in safe_updates.items():
+            if isinstance(value, dict) and isinstance(manifest.get(key), dict):
+                manifest[key].update(value)
+            else:
+                manifest[key] = value
+        manifest['updated_at'] = get_local_time()
+        manifest['best_epoch'] = self.best_epoch
+        manifest['best_validation'] = _json_safe(self.best_result)
+        manifest['best_checkpoint'] = self.best_ckpt
+        atomic_json_save(manifest, self.manifest_path)
+
+    def _training_checkpoint_payload(self, epoch, cur_eval_step, legacy_checkpoint):
+        if self.all_item_code is None:
+            raise RuntimeError('Cannot save resumable checkpoint without all_item_code')
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        payload = {
+            'format': 'diger_true_e2e_training_state',
+            'version': TRAINING_CHECKPOINT_VERSION,
+            'epoch': int(epoch),
+            'next_epoch': int(epoch) + 1,
+            'global_step': int(self.global_step),
+            'cur_eval_step': int(cur_eval_step),
+            'best_score': float(self.best_score),
+            'best_result': _json_safe(self.best_result),
+            'best_epoch': self.best_epoch,
+            'best_checkpoint': (
+                os.path.abspath(self.best_ckpt) if self.best_ckpt else None
+            ),
+            'legacy_checkpoint': os.path.abspath(legacy_checkpoint),
+            'last_validation_metrics': _json_safe(self.last_validation_metrics),
+            'last_codebook_stats': _json_safe(self.last_codebook_stats),
+            'last_assignment_stats': _json_safe(self.last_assignment_stats),
+            'last_rec_gradient_report': _json_safe(self.last_rec_gradient_report),
+            'all_item_code': self.all_item_code.detach().cpu(),
+            'model_rec': model_rec.state_dict(),
+            'model_id': model_id.state_dict(),
+            'rec_optimizer': self.rec_optimizer.state_dict(),
+            'rec_scheduler': self.rec_lr_scheduler.state_dict(),
+            'id_optimizer': (
+                self.id_optimizer.state_dict() if hasattr(self, 'id_optimizer') else None
+            ),
+            'id_scheduler': (
+                self.id_lr_scheduler.state_dict()
+                if hasattr(self, 'id_lr_scheduler') else None
+            ),
+            'rng_state': capture_rng_state(),
+            'config': resumable_config_snapshot(self.config),
+            'config_fingerprint': resumable_config_fingerprint(self.config),
+            'code_state': self._repo_metadata(),
+        }
+        return payload
+
+    def _save_resume_checkpoint(
+        self, epoch, cur_eval_step, legacy_checkpoint, resume_path=None,
+    ):
+        self.accelerator.wait_for_everyone()
+        if resume_path is None:
+            resume_path = f'{legacy_checkpoint}.resume'
+        resume_path = os.path.abspath(resume_path)
+        if self.accelerator.is_main_process:
+            payload = self._training_checkpoint_payload(
+                epoch, cur_eval_step, legacy_checkpoint
+            )
+            atomic_torch_save(payload, resume_path)
+            self.log(f'[Epoch {epoch}] Save resumable state {resume_path}')
+            self._update_manifest(
+                latest_epoch=int(epoch),
+                latest_validation=self.last_validation_metrics,
+                latest_codebook_stats=self.last_codebook_stats,
+                latest_resume_checkpoint=resume_path,
+            )
+        self.accelerator.wait_for_everyone()
+        return resume_path
+
+    @staticmethod
+    def _config_mismatches(saved, current):
+        keys = sorted(set(saved) | set(current))
+        return {
+            key: {'saved': saved.get(key), 'current': current.get(key)}
+            for key in keys
+            if saved.get(key) != current.get(key)
+        }
+
+    def _load_resume_checkpoint(self, resume_path):
+        resume_path = os.path.abspath(os.fspath(resume_path))
+        checkpoint = load_torch_checkpoint(resume_path, map_location='cpu')
+        if checkpoint.get('format') != 'diger_true_e2e_training_state':
+            raise ValueError(f'Not a DIGER resumable checkpoint: {resume_path}')
+        if checkpoint.get('version') != TRAINING_CHECKPOINT_VERSION:
+            raise ValueError(
+                f'Unsupported training checkpoint version: {checkpoint.get("version")}'
+            )
+
+        current_config = resumable_config_snapshot(self.config)
+        saved_config = checkpoint.get('config', {})
+        if checkpoint.get('config_fingerprint') != resumable_config_fingerprint(
+            self.config
+        ):
+            mismatches = self._config_mismatches(saved_config, current_config)
+            if not self.config.get('allow_resume_config_mismatch', False):
+                raise ValueError(
+                    'Resume configuration mismatch; exact continuation refused: '
+                    f'{mismatches}'
+                )
+            self.log(f'[Resume] WARNING configuration mismatch allowed: {mismatches}')
+
+        saved_code = checkpoint.get('code_state', {})
+        current_code = self._repo_metadata()
+        code_keys = ('git_head', 'git_diff_sha256')
+        code_mismatches = {
+            key: {'saved': saved_code.get(key), 'current': current_code.get(key)}
+            for key in code_keys
+            if saved_code.get(key) != current_code.get(key)
+        }
+        if code_mismatches and not self.config.get(
+            'allow_resume_code_mismatch', False
+        ):
+            raise ValueError(
+                'Resume code mismatch; exact continuation refused: '
+                f'{code_mismatches}'
+            )
+        if code_mismatches:
+            self.log(f'[Resume] WARNING code mismatch allowed: {code_mismatches}')
+
+        model_rec = self.accelerator.unwrap_model(self.model_rec)
+        model_id = self.accelerator.unwrap_model(self.model_id)
+        model_rec.load_state_dict(checkpoint['model_rec'], strict=True)
+        model_id.load_state_dict(checkpoint['model_id'], strict=True)
+        self.rec_optimizer.load_state_dict(checkpoint['rec_optimizer'])
+        self.rec_lr_scheduler.load_state_dict(checkpoint['rec_scheduler'])
+        if checkpoint.get('id_optimizer') is not None:
+            if not hasattr(self, 'id_optimizer'):
+                raise RuntimeError('Checkpoint contains ID optimizer but trainer does not')
+            self.id_optimizer.load_state_dict(checkpoint['id_optimizer'])
+        if checkpoint.get('id_scheduler') is not None:
+            if not hasattr(self, 'id_lr_scheduler'):
+                raise RuntimeError('Checkpoint contains ID scheduler but trainer does not')
+            self.id_lr_scheduler.load_state_dict(checkpoint['id_scheduler'])
+
+        self.global_step = int(checkpoint['global_step'])
+        self.best_score = float(checkpoint['best_score'])
+        self.best_result = checkpoint.get('best_result', {})
+        self.best_epoch = checkpoint.get('best_epoch')
+        self.best_ckpt = checkpoint.get('best_checkpoint')
+        self.last_validation_metrics = checkpoint.get('last_validation_metrics')
+        self.last_codebook_stats = checkpoint.get('last_codebook_stats')
+        self.last_assignment_stats = checkpoint.get('last_assignment_stats')
+        self.last_rec_gradient_report = checkpoint.get('last_rec_gradient_report')
+        self.all_item_code = checkpoint['all_item_code'].to(self.device)
+        restore_rng_state(checkpoint['rng_state'])
+        next_epoch = int(checkpoint['next_epoch'])
+        cur_eval_step = int(checkpoint['cur_eval_step'])
+        self.log(
+            f'[Resume] Strictly restored {resume_path}: next_epoch={next_epoch}, '
+            f'global_step={self.global_step}, best_epoch={self.best_epoch}, '
+            f'best_{self.valid_metric}={self.best_score:.6f}'
+        )
+        return next_epoch, cur_eval_step
+
+    def _save_latest_resumable_bundle(self, epoch, cur_eval_step, reason):
+        legacy_checkpoint = self.safe_save(
+            epoch, self.all_item_code, prefix='latest'
+        )
+        resume_path = self._save_resume_checkpoint(
+            epoch, cur_eval_step, legacy_checkpoint
+        )
+        self._update_manifest(
+            status='completed' if reason == 'max_epochs' else 'stopped',
+            stop_reason=reason,
+            stopped_epoch=int(epoch),
+            latest_checkpoint=os.path.abspath(legacy_checkpoint),
+            latest_resume_checkpoint=resume_path,
+        )
+        return legacy_checkpoint, resume_path
+
     def evaluate(self, outputs, labels):
         batch_size, k, _ = outputs.shape                                                 
         recall_at_1, recall_at_5, recall_at_10 = [], [], []
@@ -945,20 +1800,30 @@ class Trainer(object):
             train_loss_output += "train loss" + ": %.4f" % loss_dict
         return train_loss_output + "]"
 
+    def _is_best_checkpoint_candidate(self, metrics):
+        return (
+            self.best_ckpt is None
+            or metrics[self.valid_metric] > self.best_score
+        )
+
     def train(self, verbose=True):
         stop = False
         cur_eval_step = 0
         self.best_score = 0
         self.best_result = {}
         self.best_ckpt = None
+        self.best_epoch = None
         loss_w = defaultdict(int)
 
-                                           
-        all_item_code = self.get_code(epoch_idx=-1, verbose=verbose)
-        self.all_item_code = torch.tensor(all_item_code).to(self.device)
+        resume_from = self.config.get('resume_from')
+
+        if resume_from is None:
+            all_item_code = self.get_code(epoch_idx=-1, verbose=verbose)
+            self.all_item_code = torch.tensor(all_item_code).to(self.device)
 
                                          
-        end_to_end = self.config.get('end_to_end', False)
+        true_e2e = self.is_true_e2e
+        end_to_end = self.config.get('end_to_end', False) or true_e2e
         model_rec_unwrapped = self.accelerator.unwrap_model(self.model_rec)
         model_id_unwrapped = self.accelerator.unwrap_model(self.model_id)
 
@@ -1059,7 +1924,17 @@ class Trainer(object):
             loss_w['kl_loss'] = self.config.get('kl_loss_weight', 0.0)
             loss_w['dec_cl_loss'] = self.config.get('dec_cl_loss_weight', 0.0)
 
-            self.log(f'[Training Mode] End-to-end training enabled')
+            if true_e2e:
+                self.log(
+                    '[Training Mode] Single-GPU True-E2E enabled; '
+                    f'assignment_mode={self.training_mode}'
+                )
+                self.log(
+                    '[Training Mode] Objective: semantic recommendation + hard suffix '
+                    '+ latent reconstruction + VQ'
+                )
+            else:
+                self.log(f'[Training Mode] End-to-end training enabled')
             self.log(f'[Training Mode] Loss weights: {dict(loss_w)}')
         else:
             self.log(f'[Training Mode] Recommender model unfrozen (semantic_embedding frozen)')
@@ -1089,13 +1964,23 @@ class Trainer(object):
         sigma_params = [name for name, p in model_id_unwrapped.named_parameters() if 'sigma' in name.lower()]
         if sigma_params:
             self.log("")
-            self.log(f"========== Learnable Sigma Parameters (Base-2 Exponential) ==========")
+            direct_sigma = self.config.get('use_simple_uncertainty_loss', False)
+            sigma_parameterization = (
+                'Direct Non-negative Scale'
+                if direct_sigma else 'Base-2 Exponential'
+            )
+            self.log(
+                f"========== Learnable Sigma Parameters ({sigma_parameterization}) =========="
+            )
             for name in sigma_params:
                 param = dict(model_id_unwrapped.named_parameters())[name]
                 sigma_val = param.data.item()
-                s_val = 2 ** sigma_val
                 self.log(f"  {name}: σ={sigma_val:.6f}, requires_grad={param.requires_grad}")
-                self.log(f"    -> Noise scale: s = 2^σ = 2^{sigma_val:.3f} = {s_val:.6f}")
+                if direct_sigma:
+                    self.log(f"    -> Noise scale: s = |σ| = {abs(sigma_val):.6f}")
+                else:
+                    s_val = 2 ** sigma_val
+                    self.log(f"    -> Noise scale: s = 2^σ = 2^{sigma_val:.3f} = {s_val:.6f}")
             self.log(f"=" * 50)
 
                                     
@@ -1112,7 +1997,16 @@ class Trainer(object):
         self.log(f"=" * 50)
         self.log("")
 
-        for epoch_idx in range(self.epochs):
+        start_epoch = 0
+        if resume_from is not None:
+            start_epoch, cur_eval_step = self._load_resume_checkpoint(resume_from)
+            if start_epoch >= self.epochs:
+                raise ValueError(
+                    f'Resume next_epoch {start_epoch} is not below epochs={self.epochs}'
+                )
+        self._initialize_manifest(resume_from=resume_from)
+
+        for epoch_idx in range(start_epoch, self.epochs):
             self.accelerator.wait_for_everyone()
 
                                                                  
@@ -1155,11 +2049,24 @@ class Trainer(object):
 
                    
             training_start_time = time()
-            train_loss = self._train_epoch_rec(epoch_idx, loss_w=current_loss_w, freeze_id=is_id_frozen, verbose=verbose)
+            if true_e2e:
+                train_loss = self._train_epoch_true_e2e(
+                    epoch_idx, verbose=verbose
+                )
+            else:
+                train_loss = self._train_epoch_rec(
+                    epoch_idx,
+                    loss_w=current_loss_w,
+                    freeze_id=is_id_frozen,
+                    verbose=verbose,
+                )
             training_end_time = time()
 
                                                                           
-            if self.config.get('use_adaptive_selection', False) and not is_id_frozen:
+            if (
+                self.config.get('use_adaptive_selection', False)
+                or 'frqud' in self.training_mode
+            ) and not is_id_frozen:
                 stats = model_id_unwrapped.get_adaptive_selection_stats()
 
                 if stats['total_count'] > 0:
@@ -1219,10 +2126,13 @@ class Trainer(object):
                                                  
             metrics = self._test_epoch(test_data=self.valid_data, code=self.all_item_code, verbose=verbose)
             total_metrics = metrics
+            self.last_validation_metrics = total_metrics
 
-            if total_metrics[self.valid_metric] > self.best_score:
+            is_best = self._is_best_checkpoint_candidate(total_metrics)
+            if is_best:
                 self.best_score = total_metrics[self.valid_metric]
                 self.best_result = total_metrics
+                self.best_epoch = epoch_idx
                 cur_eval_step = 0
                 self.best_ckpt = self.safe_save(epoch_idx, self.all_item_code)
             else:
@@ -1233,11 +2143,38 @@ class Trainer(object):
 
             self.log(f'[Epoch {epoch_idx}] Val Results: {total_metrics}')
 
+            if is_best:
+                self._save_resume_checkpoint(
+                    epoch_idx, cur_eval_step, self.best_ckpt
+                )
+
             self.accelerator.wait_for_everyone()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            stop_after_epoch = int(self.config.get('stop_after_epoch', -1))
+            stop_reason = None
             if stop:
+                stop_reason = 'early_stop'
+            elif self.stop_requested:
+                stop_reason = self.stop_request_reason or 'external_request'
+            elif stop_after_epoch >= 0 and epoch_idx >= stop_after_epoch:
+                stop_reason = 'requested_epoch_limit'
+                self.log(
+                    f'[Training] Requested stop after epoch {epoch_idx}; '
+                    'the scheduler horizon remains configured by epochs.'
+                )
+            elif epoch_idx == self.epochs - 1:
+                stop_reason = 'max_epochs'
+
+            if stop_reason is not None:
+                self.log(
+                    f'[Training] Saving latest resumable checkpoint before '
+                    f'stop: reason={stop_reason}'
+                )
+                self._save_latest_resumable_bundle(
+                    epoch_idx, cur_eval_step, stop_reason
+                )
                 break
 
                                                       
@@ -1290,16 +2227,23 @@ class Trainer(object):
             self.log("")
 
                                      
-            self.log("Testing Stage 1 best model on test set...")
-            stage1_test_results = self.test(verbose=verbose, model_file=self.best_ckpt)
-            self.log("")
-            self.log("="*60)
-            self.log(f"Stage 1 Test Results: {stage1_test_results}")
-            self.log("="*60)
-            self.log("")
-
-                                                        
-            self.stage1_test_results = stage1_test_results
+            if self.config.get('evaluate_test_at_end', True):
+                self.log("Testing Stage 1 best model on test set...")
+                stage1_test_results = self.test(
+                    verbose=verbose, model_file=self.best_ckpt
+                )
+                self.log("")
+                self.log("="*60)
+                self.log(f"Stage 1 Test Results: {stage1_test_results}")
+                self.log("="*60)
+                self.log("")
+                self.stage1_test_results = stage1_test_results
+            else:
+                self.stage1_test_results = None
+                self.log(
+                    '[Screening] Test evaluation disabled; checkpoint '
+                    'selection used validation only.'
+                )
 
         if frozen_phase_epochs > 0 and end_to_end:
             self.log("")
@@ -1418,13 +2362,22 @@ class Trainer(object):
             self.log("")
 
                                      
+            if not self.config.get('evaluate_test_at_end', True):
+                self.log(
+                    '[Screening] Frozen-tokenizer test evaluation disabled.'
+                )
+                return self.best_score
+
             self.log("Testing frozen-tokenizer best model on test set...")
-            frozen_phase_test_results = self.test(verbose=verbose, model_file=frozen_phase_best_ckpt)
+            frozen_phase_test_results = self.test(
+                verbose=verbose, model_file=frozen_phase_best_ckpt
+            )
             self.log("")
             self.log("="*60)
             self.log(f"Frozen-tokenizer test results: {frozen_phase_test_results}")
             self.log("="*60)
             self.log("")
+            self.final_test_results = frozen_phase_test_results
 
                                                                   
             if self.stage1_test_results is not None:
@@ -1502,8 +2455,11 @@ class Trainer(object):
             code2item[str(c)].append(i+1)
 
         item_code = torch.tensor(code).to(self.device)
+        max_eval_batches = int(self.config.get('max_eval_batches', 0))
 
         for batch_idx, data in enumerate(iter_data):
+            if max_eval_batches > 0 and batch_idx >= max_eval_batches:
+                break
             input_ids, attention_mask, labels \
                 = data["input_ids"].to(self.device), data["attention_mask"].to(self.device), data["targets"].to(self.device)
 
@@ -1537,7 +2493,45 @@ class Trainer(object):
         model_rec = self.accelerator.unwrap_model(self.model_rec)
         model_id = self.accelerator.unwrap_model(self.model_id)
         all_item_embs = model_rec.semantic_embedding.weight.data[1:]
-        all_item_prefix = model_id.get_indices(all_item_embs).detach().cpu().numpy()
+        all_item_prefix = model_id.get_indices(
+            all_item_embs, use_sinkhorn=True
+        ).detach().cpu().numpy()
+
+        sinkhorn_stats = []
+        for level_index in range(self.code_length - 1):
+            level_codes = all_item_prefix[:, level_index].tolist()
+            used = len(set(level_codes))
+            sinkhorn_stats.append(
+                {
+                    'level': level_index + 1,
+                    'used': used,
+                    'dead': self.code_num - used,
+                    'balance': balance(level_codes, ncentroids=self.code_num),
+                }
+            )
+
+        nearest_stats = None
+        if self.is_true_e2e:
+            nearest_prefix = model_id.get_indices(
+                all_item_embs, use_sinkhorn=False
+            ).detach().cpu().numpy()
+            nearest_stats = []
+            for level_index in range(self.code_length - 1):
+                level_codes = nearest_prefix[:, level_index].tolist()
+                nearest_stats.append(
+                    {
+                        'level': level_index + 1,
+                        'used': len(set(level_codes)),
+                        'dead': self.code_num - len(set(level_codes)),
+                        'balance': balance(
+                            level_codes, ncentroids=self.code_num
+                        ),
+                    }
+                )
+            self.log(
+                f'[Epoch {epoch_idx}] [TOKENIZER] nearest-code diagnostic '
+                f'(not used for evaluation): {nearest_stats}'
+            )
 
 
         if verbose:
@@ -1557,10 +2551,55 @@ class Trainer(object):
             all_item_tokens.append(all_item_prefix[i]+[len(tokens2item[str_id])-1])
             max_conflict = max(max_conflict, len(tokens2item[str_id]))
         self.log(f'[Epoch {epoch_idx}] [TOKENIZER] RQ-VAE semantic IDs, maximum conflict: {max_conflict}')
-        if max_conflict > self.code_num:
-            raise ValueError(
-                f'[TOKENIZER] RQ-VAE semantic IDs conflict with codebook size: '
-                f'{max_conflict} > {self.code_num}. Please increase the codebook size.'
+        collision_prefixes = sum(
+            len(item_ids) > 1 for item_ids in tokens2item.values()
+        )
+        collision_items = sum(
+            len(item_ids) for item_ids in tokens2item.values()
+            if len(item_ids) > 1
+        )
+        item_count = max(len(all_item_prefix), 1)
+        previous_change = None
+        if self.all_item_code is not None:
+            previous_codes = self.all_item_code
+            if torch.is_tensor(previous_codes):
+                previous_codes = previous_codes.detach().cpu().numpy()
+            previous_change = semantic_id_change_stats(
+                previous_codes,
+                all_item_tokens,
+                prefix_length=self.code_length - 1,
+            )
+
+        map_hash = semantic_id_map_sha256(all_item_tokens)
+        self.last_codebook_stats = {
+            'epoch': int(epoch_idx),
+            'sinkhorn': sinkhorn_stats,
+            'nearest': nearest_stats,
+            'prefix_unique': len(tokens2item),
+            'collision_prefixes': collision_prefixes,
+            'collision_items': collision_items,
+            'collision_item_rate': collision_items / item_count,
+            'maximum_conflict': max_conflict,
+            'suffix_used': max_conflict,
+            'map_sha256': map_hash,
+            'previous_epoch_change': previous_change,
+        }
+        self.log(
+            f'[Epoch {epoch_idx}] [SID MAP] map_sha256={map_hash}, '
+            f'previous_change={previous_change}'
+        )
+        self.log(
+            f'[Epoch {epoch_idx}] [TOKENIZER] prefix_unique={len(tokens2item)}, '
+            f'collision_prefixes={collision_prefixes}, '
+            f'collision_items={collision_items}, '
+            f'collision_item_rate={collision_items / item_count:.6f}, '
+            f'suffix_used={max_conflict}, suffix_exceeds_256={max_conflict > 256}'
+        )
+        suffix_capacity = model_rec.token_embeddings[-1].num_embeddings
+        if max_conflict > suffix_capacity:
+            raise RuntimeError(
+                f'[TOKENIZER] RQ-VAE semantic IDs conflict with suffix capacity: '
+                f'{max_conflict} > {suffix_capacity}. The run is invalid and was stopped.'
             )
 
         return all_item_tokens

@@ -38,7 +38,6 @@ case "${DATASET}" in
     ;;
 esac
 
-# Allow callers to pass a custom embedding path (e.g., user-provided LLM embeddings).
 if [ -n "${RQVAE_EMBEDDING_PATH:-}" ]; then
   EMB_PATH="${RQVAE_EMBEDDING_PATH}"
   if [ -z "${RQVAE_DATASET_TAG:-}" ]; then
@@ -46,7 +45,6 @@ if [ -n "${RQVAE_EMBEDDING_PATH:-}" ]; then
   fi
 fi
 
-# Optional output tag override (for reproducibility logs only; canonical path still uses DATASET).
 if [ -n "${RQVAE_DATASET_TAG:-}" ]; then
   DATASET_TAG="${RQVAE_DATASET_TAG}"
 fi
@@ -63,9 +61,6 @@ if [[ "${GPU}" == "cpu" ]]; then
 elif [[ "${GPU}" == "cuda" ]]; then
   DEVICE="cuda"
 else
-  # Accept one GPU (e.g., "0") or up to two (e.g., "0,1" or "0 1").
-  # RQ-VAE pretraining itself is single-device; if multiple IDs are given we keep
-  # both visible for compatibility but bind to the first one.
   GPU_LIST="${GPU#cuda:}"
   GPU_LIST="${GPU_LIST//,/ }"
   read -r -a _gpu_arr <<<"${GPU_LIST}"
@@ -86,7 +81,7 @@ else
     exit 2
   fi
 
-  DEVICE="cuda:${_gpu_arr[0]}"
+  DEVICE="cuda:0"
   CUDA_VISIBLE_GPUS="${_gpu_arr[*]// /,}"
 fi
 EPOCHS="${RQVAE_EPOCHS:-10000}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a released DIGER checkpoint without starting training."""
+"""Strictly load a DIGER checkpoint and evaluate one requested split."""
 
 import argparse
 import hashlib
@@ -27,18 +27,34 @@ from vq import RQVAE  # noqa: E402
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Strictly load a DIGER checkpoint bundle and evaluate it on the test set. "
+            "Strictly load a DIGER checkpoint bundle and evaluate it on validation or test. "
             "The .pt.rqvae and .code.json files must be next to the main .pt file."
         )
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument(
-        "--config", type=Path, default=REPO_ROOT / "config" / "beauty_jo.yaml"
+        "--config", type=Path, default=REPO_ROOT / "config" / "beauty_gradient_fix.yaml"
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--ignore-manifest-config",
+        action="store_true",
+        help="Do not merge the run manifest's resolved_config into the YAML config.",
+    )
+    parser.add_argument("--split", choices=("valid", "test"), default="test")
+    parser.add_argument(
+        "--data-path",
+        "--data_path",
+        type=Path,
+        default=None,
+        help="Optional read-only dataset root override.",
+    )
     parser.add_argument("--eval-batch-size", "--eval_batch_size", type=int, default=None)
     parser.add_argument("--num-workers", "--num_workers", type=int, default=None)
     parser.add_argument("--num-beams", "--num_beams", type=int, default=None)
+    parser.add_argument(
+        "--max-eval-batches", "--max_eval_batches", type=int, default=0
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -153,7 +169,7 @@ def batch_metrics(outputs, labels):
 
 
 @torch.inference_mode()
-def evaluate(model, data_loader, code, device):
+def evaluate(model, data_loader, code, device, max_eval_batches=0):
     model.to(device)
     model.device = device
     model.eval()
@@ -163,7 +179,9 @@ def evaluate(model, data_loader, code, device):
     )}
     sample_count = 0
 
-    for batch in tqdm(data_loader, desc="Evaluate", ncols=100):
+    for batch_index, batch in enumerate(tqdm(data_loader, desc="Evaluate", ncols=100)):
+        if max_eval_batches > 0 and batch_index >= max_eval_batches:
+            break
         input_ids = batch["input_ids"].to(device)
         labels = batch["targets"].to(device)
         batch_size = input_ids.size(0)
@@ -193,15 +211,25 @@ def main():
 
     with config_path.open("r") as file_obj:
         config = yaml.safe_load(file_obj)
+    manifest_path = checkpoint.parent / "manifest.json"
+    manifest_config_used = False
+    if manifest_path.is_file() and not args.ignore_manifest_config:
+        with manifest_path.open("r") as file_obj:
+            manifest = json.load(file_obj)
+        resolved_config = manifest.get("resolved_config")
+        if isinstance(resolved_config, dict):
+            config.update(resolved_config)
+            manifest_config_used = True
     if args.eval_batch_size is not None:
         config["eval_batch_size"] = args.eval_batch_size
     if args.num_workers is not None:
         config["num_workers"] = args.num_workers
     if args.num_beams is not None:
         config["num_beams"] = args.num_beams
-    config["data_path"] = str(resolve_path(Path(config["data_path"])))
+    data_path = args.data_path if args.data_path is not None else Path(config["data_path"])
+    config["data_path"] = str(resolve_path(data_path))
 
-    _, num_items, _, _, test = load_split_data(config)
+    _, num_items, _, valid, test = load_split_data(config)
     model_state = checkpoint_state(files["model"])
     rqvae_state = checkpoint_state(files["rqvae"])
     model = build_models(config, num_items, model_state, rqvae_state, files)
@@ -210,10 +238,11 @@ def main():
         code = json.load(file_obj)
     validate_codes(code, num_items, config["code_length"], files["codes"])
 
-    test_dataset = SequentialSplitDataset(config, num_items, test)
+    selected_split = valid if args.split == "valid" else test
+    evaluation_dataset = SequentialSplitDataset(config, num_items, selected_split)
     collator = Collator(eos_token_id=-1, pad_token_id=0, max_length=config["max_length"])
     data_loader = DataLoader(
-        test_dataset,
+        evaluation_dataset,
         batch_size=config["eval_batch_size"],
         shuffle=False,
         num_workers=config["num_workers"],
@@ -223,12 +252,25 @@ def main():
 
     result = {
         "checkpoint": str(checkpoint),
+        "manifest": str(manifest_path) if manifest_path.is_file() else None,
+        "manifest_config_used": manifest_config_used,
         "sha256": {name: sha256(path) for name, path in files.items()},
         "dataset": config["dataset"],
+        "split": args.split,
         "num_beams": config["num_beams"],
         "eval_batch_size": config["eval_batch_size"],
-        "samples": len(test_dataset),
-        "metrics": evaluate(model, data_loader, code, torch.device(args.device)),
+        "samples": len(evaluation_dataset),
+        "evaluated_samples": min(
+            len(evaluation_dataset),
+            args.max_eval_batches * config["eval_batch_size"]
+        ) if args.max_eval_batches > 0 else len(evaluation_dataset),
+        "metrics": evaluate(
+            model,
+            data_loader,
+            code,
+            torch.device(args.device),
+            max_eval_batches=args.max_eval_batches,
+        ),
     }
     output = json.dumps(result, indent=2, sort_keys=True)
     print(output)

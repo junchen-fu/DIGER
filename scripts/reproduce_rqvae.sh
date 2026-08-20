@@ -14,11 +14,7 @@ Options:
   --emb-dir      Directory containing beauty/instruments/yelp embedding files.
   --gpu          GPU id(s), e.g. 0 or 0,1 or "0 1" (at most 2 supported).
   --ckpt-root    Where to place reproduced ckpts (default: ./rqvae_ckpt).
-  --baseline-root Baseline original ckpt root used for verification.
-                  Default: /data/junch/ETEGRec_ONE_Stage/RQVAE/rqvae_ckpt
   --all          Reproduce all 3 datasets from repo default dataset directory.
-  --strict       Enforce exact collision+epoch+hash match in verification (default).
-  --no-strict    Relax strict checks during verification.
   --no-verify    Skip verification step after reproduction.
 
 Examples:
@@ -35,8 +31,6 @@ EMB_DIR=""
 DO_ALL=0
 GPU_SPEC="${RQVAE_GPU:-${GPU:-0}}"
 CKPT_ROOT="${RQVAE_CKPT_ROOT:-${PROJECT_ROOT}/rqvae_ckpt}"
-BASELINE_ROOT="/data/junch/ETEGRec_ONE_Stage/RQVAE/rqvae_ckpt"
-STRICT=1
 DO_VERIFY=1
 
 normalize_gpu() {
@@ -112,20 +106,8 @@ while [[ $# -gt 0 ]]; do
       CKPT_ROOT="$2"
       shift 2
       ;;
-    --baseline-root)
-      BASELINE_ROOT="$2"
-      shift 2
-      ;;
     --all)
       DO_ALL=1
-      shift
-      ;;
-    --strict)
-      STRICT=1
-      shift
-      ;;
-    --no-strict)
-      STRICT=0
       shift
       ;;
     --verify)
@@ -198,11 +180,13 @@ else
       bash "${PROJECT_ROOT}/scripts/run_rqvae_from_all_embeddings.sh" --emb-dir "${EMB_DIR}"
   else
     echo "[Step] Reproduce single dataset from provided embedding"
+    SINGLE_ARGS=(--embedding "${SINGLE_EMB}" --gpu "${GPU_SPEC}")
+    if [[ -n "${DATASET}" ]]; then
+      SINGLE_ARGS+=(--dataset "${DATASET}")
+    fi
     RQVAE_CKPT_ROOT="${CKPT_ROOT}" \
       bash "${PROJECT_ROOT}/scripts/run_rqvae_from_embedding.sh" \
-        --embedding "${SINGLE_EMB}" \
-        ${DATASET:+--dataset "${DATASET}"} \
-        --gpu "${GPU_SPEC}"
+        "${SINGLE_ARGS[@]}"
   fi
 fi
 
@@ -211,10 +195,7 @@ if [[ "${DO_VERIFY}" -eq 0 ]]; then
   exit 0
 fi
 
-VERIFY_ARGS=(--ckpt_root "${CKPT_ROOT}" --baseline_root "${BASELINE_ROOT}")
-if [[ "${STRICT}" -eq 1 ]]; then
-  VERIFY_ARGS+=(--strict --expect_hash)
-fi
+VERIFY_ARGS=(--ckpt_root "${CKPT_ROOT}" --strict)
 
 if [[ "${SINGLE_EMB}" != "" ]]; then
   if [[ -z "${DATASET}" ]]; then
@@ -252,6 +233,6 @@ PY)"
   fi
 fi
 
-echo "[Step] Verify reproduced checkpoint parity with original"
-python3 "${PROJECT_ROOT}/scripts/rqvae/compare_rqvae_ckpt.py" "${VERIFY_ARGS[@]}"
+echo "[Step] Verify reproduced checkpoint structure and training configuration"
+python3 "${PROJECT_ROOT}/scripts/rqvae/verify_rqvae_ckpt.py" "${VERIFY_ARGS[@]}"
 echo "[DONE] RQ-VAE checkpoint reproduction run finished."

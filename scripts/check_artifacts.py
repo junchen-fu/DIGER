@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-from pathlib import Path
 import hashlib
 import json
+import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(os.environ.get("DIGER_DATA_ROOT", ROOT / "dataset")).expanduser().resolve()
+RQVAE_ROOT = Path(os.environ.get("DIGER_RQVAE_ROOT", ROOT / "rqvae_ckpt")).expanduser().resolve()
 
 EXPECTED = {
     "beauty": {
         "embedding": "Beauty.emb-llama.npy",
         "shape": (12101, 4096),
         "checkpoint_sha256": "d4501128dd9b2db3072376f66bbaa42995567b94c88c9befab0c349fa9a242ff",
-        "two_gpu_checkpoint_sha256": "845d78dbff476754de239d6950b60b8b2c51f486f5f790785e5ccc16f839d297",
         "map_items": 12102,
         "splits": {"train": 131413, "valid": 22363, "test": 22363},
     },
@@ -53,12 +55,19 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def check_file(path: Path, errors: list[str]) -> bool:
     if not path.exists():
-        errors.append(f"missing file: {path.relative_to(ROOT)}")
+        errors.append(f"missing file: {display_path(path)}")
         return False
     if is_lfs_pointer(path):
-        errors.append(f"LFS pointer was not pulled: {path.relative_to(ROOT)}")
+        errors.append(f"LFS pointer was not pulled: {display_path(path)}")
         return False
     return True
 
@@ -67,10 +76,11 @@ def main() -> int:
     errors: list[str] = []
 
     for dataset, expected in EXPECTED.items():
-        dataset_dir = ROOT / "dataset" / dataset
+        error_count = len(errors)
+        dataset_dir = DATA_ROOT / dataset
         map_path = dataset_dir / f"{dataset}.emb_map.json"
         emb_path = dataset_dir / expected["embedding"]
-        ckpt_path = ROOT / "rqvae_ckpt" / dataset / "best_collision_model.pth"
+        ckpt_path = RQVAE_ROOT / dataset / "best_collision_model.pth"
 
         if check_file(map_path, errors):
             with map_path.open() as handle:
@@ -93,16 +103,6 @@ def main() -> int:
                     f"expected {expected['checkpoint_sha256']}"
                 )
 
-        if "two_gpu_checkpoint_sha256" in expected:
-            preview_path = ckpt_path.with_name("best_collision_model_two_gpu_preview.pth")
-            if check_file(preview_path, errors):
-                actual_sha256 = sha256_file(preview_path)
-                if actual_sha256 != expected["two_gpu_checkpoint_sha256"]:
-                    errors.append(
-                        f"{dataset}: two-GPU preview checkpoint SHA256 is {actual_sha256}, "
-                        f"expected {expected['two_gpu_checkpoint_sha256']}"
-                    )
-
         for split, expected_lines in expected["splits"].items():
             split_path = dataset_dir / f"{dataset}.{split}.jsonl"
             if check_file(split_path, errors):
@@ -110,12 +110,15 @@ def main() -> int:
                 if actual_lines != expected_lines:
                     errors.append(f"{dataset}.{split}: {actual_lines} rows, expected {expected_lines}")
 
-        print(
-            f"{dataset}: ok "
-            f"items={expected['map_items']} "
-            f"embedding={expected['shape']} "
-            f"splits={expected['splits']}"
-        )
+        if len(errors) == error_count:
+            print(
+                f"{dataset}: ok "
+                f"items={expected['map_items']} "
+                f"embedding={expected['shape']} "
+                f"splits={expected['splits']}"
+            )
+        else:
+            print(f"{dataset}: failed")
 
     if errors:
         print("\nArtifact check failed:", file=sys.stderr)

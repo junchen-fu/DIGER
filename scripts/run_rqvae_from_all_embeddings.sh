@@ -40,35 +40,27 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${GPU}" == "cpu" || "${GPU}" == "cuda" ]]; then
-  :
-elif [[ "${GPU}" == cuda:* ]]; then
+if [[ "${GPU}" != "cpu" && "${GPU}" != "cuda" ]]; then
   GPU="${GPU#cuda:}"
-fi
-
-GPU_LIST="${GPU//,/ }"
-read -r -a _gpu_arr <<<"${GPU_LIST}"
-if (( ${#_gpu_arr[@]} > 2 )); then
-  echo "RQ-VAE scripts support at most 2 GPUs. Received: ${GPU}" >&2
-  exit 2
-fi
-if (( ${#_gpu_arr[@]} == 0 )) || [[ -z "${_gpu_arr[0]}" ]]; then
-  echo "Invalid GPU spec: ${GPU}" >&2
-  exit 2
-fi
-if ! [[ "${_gpu_arr[0]}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid GPU index: ${_gpu_arr[0]}" >&2
-  exit 2
-fi
-if (( ${#_gpu_arr[@]} == 2 )) && ! [[ "${_gpu_arr[1]}" =~ ^[0-9]+$ ]]; then
-  echo "Invalid GPU index: ${_gpu_arr[1]}" >&2
-  exit 2
-fi
-
-if (( ${#_gpu_arr[@]} == 2 )); then
-  GPU="${_gpu_arr[0]},${_gpu_arr[1]}"
-else
-  GPU="${_gpu_arr[0]}"
+  GPU_LIST="${GPU//,/ }"
+  read -r -a _gpu_arr <<<"${GPU_LIST}"
+  if (( ${#_gpu_arr[@]} > 2 )); then
+    echo "RQ-VAE scripts support at most 2 GPUs. Received: ${GPU}" >&2
+    exit 2
+  fi
+  if (( ${#_gpu_arr[@]} == 0 )) || [[ -z "${_gpu_arr[0]}" ]]; then
+    echo "Invalid GPU spec: ${GPU}" >&2
+    exit 2
+  fi
+  if ! [[ "${_gpu_arr[0]}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid GPU index: ${_gpu_arr[0]}" >&2
+    exit 2
+  fi
+  if (( ${#_gpu_arr[@]} == 2 )) && ! [[ "${_gpu_arr[1]}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid GPU index: ${_gpu_arr[1]}" >&2
+    exit 2
+  fi
+  GPU="$(IFS=,; echo "${_gpu_arr[*]}")"
 fi
 
 EMB_ROOT="$(cd "${EMB_DIR}" && pwd)"

@@ -3,7 +3,147 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from dataclasses import dataclass
+from typing import Optional, Tuple
 from layers import *
+
+
+TRUE_E2E_ASSIGNMENT_MODES = {
+    "true_e2e_plain",
+    "true_e2e_gumbel_fixed",
+    "true_e2e_frqud",
+    "true_e2e_sdud",
+    "true_e2e_sdud_frqud",
+}
+TRUE_E2E_GUMBEL_MODES = TRUE_E2E_ASSIGNMENT_MODES - {"true_e2e_plain"}
+
+
+@dataclass
+class GumbelStraightThroughOutput:
+    soft_probabilities: torch.Tensor
+    hard_one_hot: torch.Tensor
+    straight_through_probabilities: torch.Tensor
+    hard_indices: torch.Tensor
+    noisy_logits: torch.Tensor
+    gumbel_noise: torch.Tensor
+
+
+def deterministic_straight_through(logits, temperature=1.0):
+    """Return a hard-forward, soft-backward categorical assignment."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    soft_probabilities = F.softmax(logits / temperature, dim=-1)
+    hard_indices = soft_probabilities.argmax(dim=-1)
+    hard_one_hot = F.one_hot(
+        hard_indices, num_classes=logits.shape[-1]
+    ).to(dtype=soft_probabilities.dtype)
+    straight_through_probabilities = (
+        hard_one_hot - soft_probabilities.detach() + soft_probabilities
+    )
+    return (
+        soft_probabilities,
+        hard_one_hot,
+        straight_through_probabilities,
+        hard_indices,
+    )
+
+
+def sample_gumbel_like(logits):
+    uniform = torch.rand_like(logits)
+    epsilon = torch.finfo(uniform.dtype).eps
+    uniform = uniform.clamp(min=epsilon, max=1.0 - epsilon)
+    return -torch.log(-torch.log(uniform))
+
+
+def gumbel_straight_through(
+    logits,
+    temperature=1.0,
+    noise_scale=1.0,
+    add_noise=True,
+    gumbel_noise=None,
+):
+    """Return hard-forward, soft-backward assignments with explicit noise scale."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    scale = torch.as_tensor(noise_scale, dtype=logits.dtype, device=logits.device)
+    if torch.any(scale < 0):
+        raise ValueError("noise_scale must be non-negative")
+    while scale.dim() < logits.dim():
+        scale = scale.unsqueeze(-1)
+
+    if add_noise:
+        if gumbel_noise is None:
+            gumbel_noise = sample_gumbel_like(logits)
+        elif gumbel_noise.shape != logits.shape:
+            raise ValueError("gumbel_noise must match logits")
+        noisy_logits = (logits + scale * gumbel_noise) / temperature
+    else:
+        gumbel_noise = torch.zeros_like(logits)
+        noisy_logits = logits / temperature
+
+    soft_probabilities = F.softmax(noisy_logits, dim=-1)
+    hard_indices = soft_probabilities.argmax(dim=-1)
+    hard_one_hot = F.one_hot(
+        hard_indices, num_classes=logits.shape[-1]
+    ).to(dtype=soft_probabilities.dtype)
+    straight_through_probabilities = (
+        hard_one_hot - soft_probabilities.detach() + soft_probabilities
+    )
+    return GumbelStraightThroughOutput(
+        soft_probabilities=soft_probabilities,
+        hard_one_hot=hard_one_hot,
+        straight_through_probabilities=straight_through_probabilities,
+        hard_indices=hard_indices,
+        noisy_logits=noisy_logits,
+        gumbel_noise=gumbel_noise,
+    )
+
+
+@dataclass
+class QuantizerLevelOutput:
+    assignment_logits: torch.Tensor
+    soft_probabilities: torch.Tensor
+    hard_one_hot: torch.Tensor
+    straight_through_probabilities: torch.Tensor
+    forward_probabilities: torch.Tensor
+    hard_indices: torch.Tensor
+    residual_input: torch.Tensor
+    quantized_vector: torch.Tensor
+    vq_loss: torch.Tensor
+    vq_loss_per_item: torch.Tensor
+    balance_loss: Optional[torch.Tensor] = None
+    gate_reg_loss: Optional[torch.Tensor] = None
+    sigma: Optional[torch.Tensor] = None
+    noise_scale: Optional[torch.Tensor] = None
+    effective_noise_scale: Optional[torch.Tensor] = None
+    frequency_scores: Optional[torch.Tensor] = None
+    stochastic_mask: Optional[torch.Tensor] = None
+    gumbel_noise: Optional[torch.Tensor] = None
+
+
+@dataclass
+class ResidualQuantizerOutput:
+    quantized: torch.Tensor
+    levels: Tuple[QuantizerLevelOutput, ...]
+    vq_loss: torch.Tensor
+    vq_loss_per_item: torch.Tensor
+    indices: torch.Tensor
+    balance_loss: Optional[torch.Tensor] = None
+    gate_reg_loss: Optional[torch.Tensor] = None
+    mean_sigma: Optional[torch.Tensor] = None
+
+
+@dataclass
+class RQVAEOutput:
+    quantized: torch.Tensor
+    latent: torch.Tensor
+    levels: Tuple[QuantizerLevelOutput, ...]
+    vq_loss: torch.Tensor
+    vq_loss_per_item: torch.Tensor
+    indices: torch.Tensor
+    balance_loss: Optional[torch.Tensor] = None
+    gate_reg_loss: Optional[torch.Tensor] = None
+    mean_sigma: Optional[torch.Tensor] = None
 
 
 class AutoSigmaGaussian(nn.Module):
@@ -279,8 +419,14 @@ class AutoSigmaSimple(nn.Module):
 
 
 @torch.no_grad()
-def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
-    Q = torch.exp(- distances / epsilon)
+def sinkhorn_algorithm(
+    distances,
+    epsilon,
+    sinkhorn_iterations,
+):
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    Q = torch.exp(-distances / epsilon)
 
     B = Q.shape[0]                              
     K = Q.shape[1]                                                    
@@ -330,6 +476,12 @@ class RQVAE(nn.Module):
         self.tau_anneal_init = config.get('tau_anneal_init', 2.0)                   
         self.tau_anneal_min = config.get('tau_anneal_min', 0.5)                     
         self.tau_anneal_rate = config.get('tau_anneal_rate', 0.0003)               
+        self.configured_tau_decay = config.get('tau_anneal_decay')
+        if (
+            self.configured_tau_decay is not None
+            and not 0.0 < float(self.configured_tau_decay) <= 1.0
+        ):
+            raise ValueError('tau_anneal_decay must be in (0, 1]')
                                                                                  
         self.warmup_gumbel_epochs = config.get('warmup_gumbel_epochs', 0)
                                                                       
@@ -351,13 +503,25 @@ class RQVAE(nn.Module):
         if not self.use_tau_annealing:
             return self.gumbel_tau
 
-                                                                             
-        import math
-        tau = self.tau_anneal_init * math.exp(-self.tau_anneal_rate * global_step)
+        decay = self.configured_tau_decay
+        if decay is not None:
+            tau = self.tau_anneal_init * (decay ** global_step)
+        else:
+            import math
+            tau = self.tau_anneal_init * math.exp(-self.tau_anneal_rate * global_step)
         tau = max(self.tau_anneal_min, tau)
         return tau
 
-    def forward(self, x, use_gumbel=False, current_epoch=0, global_step=0, return_latent=False):
+    def forward(self, x, use_gumbel=False, current_epoch=0, global_step=0,
+                return_latent=False, return_structured=False,
+                deterministic_st=False, assignment_temperature=None,
+                assignment_mode=None, assignment_forward="hard_st"):
+        if assignment_mode is not None and assignment_mode not in TRUE_E2E_ASSIGNMENT_MODES:
+            raise ValueError(f"Unsupported assignment_mode: {assignment_mode}")
+        if assignment_forward not in {"hard_st", "soft"}:
+            raise ValueError(
+                f"Unsupported assignment_forward: {assignment_forward}"
+            )
                                                                          
                                                                                  
                                                                                         
@@ -365,8 +529,33 @@ class RQVAE(nn.Module):
 
                                                            
         current_tau = self.get_current_tau(global_step)
+        if assignment_temperature is not None:
+            current_tau = float(assignment_temperature)
 
         latent = self.encoder(x)
+        if return_structured:
+            rq_output = self.rq(
+                latent, use_gumbel=use_gumbel, tau=current_tau,
+                use_indicator_ste=self.use_indicator_ste,
+                use_gumbel_sampling=use_gumbel_sampling,
+                current_epoch=current_epoch,
+                return_structured=True,
+                deterministic_st=deterministic_st,
+                assignment_mode=assignment_mode,
+                assignment_forward=assignment_forward,
+            )
+            return RQVAEOutput(
+                quantized=rq_output.quantized,
+                latent=latent,
+                levels=rq_output.levels,
+                vq_loss=rq_output.vq_loss,
+                vq_loss_per_item=rq_output.vq_loss_per_item,
+                indices=rq_output.indices,
+                balance_loss=rq_output.balance_loss,
+                gate_reg_loss=rq_output.gate_reg_loss,
+                mean_sigma=rq_output.mean_sigma,
+            )
+
         x_q, rq_loss, indices, code_one_hot, logit, balance_loss, gate_reg_loss, mean_sigma = self.rq(
             latent, use_gumbel=use_gumbel, tau=current_tau,
             use_indicator_ste=self.use_indicator_ste,
@@ -499,7 +688,10 @@ class ResidualVectorQuantizer(nn.Module):
         all_indices = []
         residual = x
         for i in range(len(self.vq_layers)):
-            x_res, _, indices, _, _, _, _, _ = self.vq_layers[i](residual, use_sinkhorn=use_sinkhorn)
+            x_res, _, indices, _, _, _, _, _ = self.vq_layers[i](
+                residual,
+                use_sinkhorn=use_sinkhorn,
+            )
             residual = residual - x_res
 
             all_indices.append(indices)
@@ -508,7 +700,66 @@ class ResidualVectorQuantizer(nn.Module):
 
         return all_indices
 
-    def forward(self, x, use_gumbel=False, tau=1.0, use_indicator_ste=True, use_gumbel_sampling=True, current_epoch=None):
+    def forward(self, x, use_gumbel=False, tau=1.0, use_indicator_ste=True,
+                use_gumbel_sampling=True, current_epoch=None,
+                return_structured=False, deterministic_st=False,
+                assignment_mode=None, assignment_forward="hard_st"):
+        if return_structured:
+            levels = []
+            residual = x
+            quantized = torch.zeros_like(x)
+            for quantizer in self.vq_layers:
+                level = quantizer(
+                    residual,
+                    use_sinkhorn=(
+                        False
+                        if deterministic_st or assignment_mode is not None
+                        else None
+                    ),
+                    use_gumbel=use_gumbel,
+                    tau=tau,
+                    use_indicator_ste=use_indicator_ste,
+                    use_gumbel_sampling=use_gumbel_sampling,
+                    current_epoch=current_epoch,
+                    return_structured=True,
+                    deterministic_st=deterministic_st,
+                    assignment_mode=assignment_mode,
+                    assignment_forward=assignment_forward,
+                )
+                levels.append(level)
+                residual = residual - level.quantized_vector
+                quantized = quantized + level.quantized_vector
+
+            vq_loss_per_item = torch.stack(
+                [level.vq_loss_per_item for level in levels], dim=0
+            ).mean(dim=0)
+            vq_loss = vq_loss_per_item.mean()
+            balance_losses = [
+                level.balance_loss for level in levels
+                if level.balance_loss is not None
+            ]
+            gate_losses = [
+                level.gate_reg_loss for level in levels
+                if level.gate_reg_loss is not None
+            ]
+            sigmas = [level.sigma for level in levels if level.sigma is not None]
+            return ResidualQuantizerOutput(
+                quantized=quantized,
+                levels=tuple(levels),
+                vq_loss=vq_loss,
+                vq_loss_per_item=vq_loss_per_item,
+                indices=torch.stack(
+                    [level.hard_indices for level in levels], dim=-1
+                ),
+                balance_loss=(
+                    torch.stack(balance_losses).mean() if balance_losses else None
+                ),
+                gate_reg_loss=(
+                    torch.stack(gate_losses).mean() if gate_losses else None
+                ),
+                mean_sigma=torch.stack(sigmas).mean() if sigmas else None,
+            )
+
         all_losses = []
         all_indices = []
         all_one_hots = []
@@ -625,6 +876,7 @@ class VectorQuantizer(nn.Module):
         self.register_buffer('code_usage_ema', torch.ones(self.n_e) / self.n_e)
         self.usage_momentum = config.get('usage_momentum', 0.99)
         self.hot_threshold_ratio = config.get('hot_threshold_ratio', 1.5)
+        self.gumbel_noise_scale = float(config.get('gumbel_noise_scale', 1.0))
 
                                                     
         self.use_soft_frequency = config.get('use_soft_frequency', False)
@@ -871,7 +1123,15 @@ class VectorQuantizer(nn.Module):
         centered_distances = (distances - middle) / amplitude
         return centered_distances
 
-    def forward(self, x, detach=True, use_sinkhorn=None, use_gumbel=False, tau=1.0, use_indicator_ste=True, use_gumbel_sampling=True, sample_use_gumbel_mask=None, current_epoch=None):
+    def forward(self, x, detach=True, use_sinkhorn=None, use_gumbel=False,
+                tau=1.0, use_indicator_ste=True, use_gumbel_sampling=True,
+                sample_use_gumbel_mask=None, current_epoch=None,
+                return_structured=False, deterministic_st=False,
+                assignment_mode=None, assignment_forward="hard_st"):
+        if assignment_forward not in {"hard_st", "soft"}:
+            raise ValueError(
+                f"Unsupported assignment_forward: {assignment_forward}"
+            )
                        
         latent = x.view(-1, self.e_dim)
 
@@ -910,14 +1170,16 @@ class VectorQuantizer(nn.Module):
 
                 d = ((d - middle) / amplitude).double()
                 sinkhorn_distances = (all_distances - middle) / amplitude
-                Q = sinkhorn_algorithm(sinkhorn_distances.double(), self.sk_epsilon, self.sk_iters)
+                Q = sinkhorn_algorithm(
+                    sinkhorn_distances.double(), self.sk_epsilon, self.sk_iters
+                )
                 Q = Q[local_offset:local_offset + latent.shape[0]]
             else:
                 d = self.center_distance_for_constraint(d).double()
                 Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
 
             if torch.isnan(Q).any() or torch.isinf(Q).any():
-                print(f"Sinkhorn Algorithm returns nan/inf values.")
+                raise RuntimeError("Sinkhorn produced non-finite assignments")
             indices = torch.argmax(Q, dim=-1)
         else:
             indices = torch.argmin(d, dim=-1)
@@ -960,8 +1222,113 @@ class VectorQuantizer(nn.Module):
         threshold_reg_loss = None                
         gate_reg_loss = None                                      
         sigma = None                         
+        assignment_logits = None
+        soft_probabilities = None
+        hard_one_hot = None
+        straight_through_probabilities = None
+        forward_probabilities = None
+        noise_scale = None
+        effective_noise_scale = None
+        frequency_scores = None
+        stochastic_mask = None
+        gumbel_noise = None
 
-        if use_gumbel and self.training:
+        if deterministic_st:
+            probability_shape = x.shape[:-1] + (self.n_e,)
+            assignment_logits = (-d).view(probability_shape)
+            if assignment_logits.dtype != self.embedding.weight.dtype:
+                assignment_logits = assignment_logits.float()
+            (
+                soft_probabilities,
+                hard_one_hot,
+                straight_through_probabilities,
+                indices,
+            ) = deterministic_straight_through(
+                assignment_logits, temperature=tau
+            )
+            forward_probabilities = straight_through_probabilities
+            x_q = torch.matmul(
+                forward_probabilities, self.embedding.weight
+            ).view(x.shape)
+        elif assignment_mode in TRUE_E2E_GUMBEL_MODES:
+            assignment_logits = -d
+            if assignment_logits.dtype != self.embedding.weight.dtype:
+                assignment_logits = assignment_logits.float()
+
+            deterministic_indices = assignment_logits.argmax(dim=-1)
+            uses_frequency_decay = "frqud" in assignment_mode
+            uses_standard_deviation_decay = "sdud" in assignment_mode
+
+            if uses_frequency_decay:
+                if self.training:
+                    with torch.no_grad():
+                        counts = torch.bincount(
+                            deterministic_indices.reshape(-1), minlength=self.n_e
+                        ).to(dtype=self.code_usage_ema.dtype)
+                        batch_frequency = counts / counts.sum().clamp_min(1)
+                        self.code_usage_ema.mul_(self.usage_momentum).add_(
+                            batch_frequency, alpha=1.0 - self.usage_momentum
+                        )
+                frequency_scores = self.code_usage_ema[
+                    deterministic_indices.reshape(-1)
+                ]
+                threshold = self.hot_threshold_ratio / self.n_e
+                stochastic_mask = frequency_scores > threshold
+            else:
+                stochastic_mask = torch.ones_like(
+                    deterministic_indices, dtype=torch.bool
+                )
+
+            if uses_standard_deviation_decay:
+                if not hasattr(self, "auto_sigma_module") or not isinstance(
+                    self.auto_sigma_module, AutoSigmaSimple
+                ):
+                    raise RuntimeError(
+                        "True-E2E SDUD requires use_learnable_sigma_gumbel=true "
+                        "and use_simple_uncertainty_loss=true"
+                    )
+                sigma = self.auto_sigma_module.sigma
+                noise_scale = sigma.abs().clamp(min=0.0, max=100.0)
+            else:
+                noise_scale = torch.as_tensor(
+                    self.gumbel_noise_scale,
+                    dtype=assignment_logits.dtype,
+                    device=assignment_logits.device,
+                )
+
+            if not self.training:
+                stochastic_mask = torch.zeros_like(stochastic_mask)
+            effective_noise_scale = (
+                stochastic_mask.to(dtype=assignment_logits.dtype) * noise_scale
+            )
+            assignment = gumbel_straight_through(
+                assignment_logits,
+                temperature=tau,
+                noise_scale=effective_noise_scale,
+                add_noise=self.training,
+            )
+            soft_probabilities = assignment.soft_probabilities
+            hard_one_hot = assignment.hard_one_hot
+            straight_through_probabilities = (
+                assignment.straight_through_probabilities
+            )
+            indices = assignment.hard_indices
+            gumbel_noise = assignment.gumbel_noise
+            forward_probabilities = (
+                straight_through_probabilities
+                if assignment_forward == "hard_st"
+                else soft_probabilities
+            )
+            x_q = torch.matmul(
+                forward_probabilities, self.embedding.weight
+            ).view(x.shape)
+
+            if self.training:
+                if not hasattr(self, '_gumbel_count'):
+                    self.reset_adaptive_selection_stats()
+                self._gumbel_count += int(stochastic_mask.sum().item())
+                self._deterministic_count += int((~stochastic_mask).sum().item())
+        elif use_gumbel and self.training:
                                                                             
             logits = -d
                                                             
@@ -1125,6 +1492,13 @@ class VectorQuantizer(nn.Module):
 
                                                                         
             indices = indices_selected
+            assignment_logits = logits
+            soft_probabilities = Ind_soft
+            hard_one_hot = Ind_hard
+            straight_through_probabilities = (
+                Ind_hard - Ind_soft.detach() + Ind_soft
+            )
+            forward_probabilities = straight_through_probabilities
 
             if use_indicator_ste:
                                                         
@@ -1196,22 +1570,35 @@ class VectorQuantizer(nn.Module):
                 avg_probs = self._distributed_batch_mean(Ind_soft_for_balance)
                 uniform_dist = torch.ones_like(avg_probs) / self.n_e
                 balance_loss = torch.abs(avg_probs - uniform_dist).sum()
-            else:
-                                                                   
-                pass
         else:
                                                 
             x_q = self.embedding(indices).view(x.shape)
+            assignment_logits = -d
+            if assignment_logits.dtype != self.embedding.weight.dtype:
+                assignment_logits = assignment_logits.float()
+            soft_probabilities = F.softmax(assignment_logits / tau, dim=-1)
+            hard_one_hot = F.one_hot(indices, self.n_e).to(
+                dtype=soft_probabilities.dtype
+            )
+            straight_through_probabilities = hard_one_hot
+            forward_probabilities = hard_one_hot
 
                                     
                                                                 
                                                                      
         if self.dist.lower() == 'l2':
-            codebook_loss = F.mse_loss(x_q, x.detach())
-            commitment_loss = F.mse_loss(x_q.detach(), x)
-            loss = codebook_loss + self.beta * commitment_loss
+            codebook_loss_per_item = (x_q - x.detach()).pow(2).mean(dim=-1)
+            commitment_loss_per_item = (x_q.detach() - x).pow(2).mean(dim=-1)
+            vq_loss_per_item = (
+                codebook_loss_per_item
+                + self.beta * commitment_loss_per_item
+            )
+            loss = vq_loss_per_item.mean()
         elif self.dist.lower() in ['dot', 'cos']:
-            loss = self.beta * F.cross_entropy(-d, indices.detach())
+            vq_loss_per_item = self.beta * F.cross_entropy(
+                -d, indices.detach(), reduction='none'
+            ).view(x.shape[:-1])
+            loss = vq_loss_per_item.mean()
         else:
             raise NotImplementedError
 
@@ -1219,11 +1606,52 @@ class VectorQuantizer(nn.Module):
                                                                               
                                                                     
                                                              
-        if (use_gumbel and self.use_pure_ste) or not use_gumbel:
+        if (
+            assignment_mode is None
+            and not deterministic_st
+            and ((use_gumbel and self.use_pure_ste) or not use_gumbel)
+        ):
             x_q = x + (x_q - x).detach()
 
         indices = indices.view(x.shape[:-1])
 
         logit = d
+
+        if return_structured:
+            probability_shape = x.shape[:-1] + (self.n_e,)
+            if assignment_logits.shape != probability_shape:
+                assignment_logits = assignment_logits.view(probability_shape)
+            if soft_probabilities.shape != probability_shape:
+                soft_probabilities = soft_probabilities.view(probability_shape)
+            if hard_one_hot.shape != probability_shape:
+                hard_one_hot = hard_one_hot.view(probability_shape)
+            if straight_through_probabilities.shape != probability_shape:
+                straight_through_probabilities = (
+                    straight_through_probabilities.view(probability_shape)
+                )
+            if forward_probabilities.shape != probability_shape:
+                forward_probabilities = forward_probabilities.view(
+                    probability_shape
+                )
+            return QuantizerLevelOutput(
+                assignment_logits=assignment_logits,
+                soft_probabilities=soft_probabilities,
+                hard_one_hot=hard_one_hot,
+                straight_through_probabilities=straight_through_probabilities,
+                forward_probabilities=forward_probabilities,
+                hard_indices=indices,
+                residual_input=x,
+                quantized_vector=x_q,
+                vq_loss=loss,
+                vq_loss_per_item=vq_loss_per_item,
+                balance_loss=balance_loss,
+                gate_reg_loss=gate_reg_loss,
+                sigma=sigma,
+                noise_scale=noise_scale,
+                effective_noise_scale=effective_noise_scale,
+                frequency_scores=frequency_scores,
+                stochastic_mask=stochastic_mask,
+                gumbel_noise=gumbel_noise,
+            )
 
         return x_q, loss, indices, code_one_hot, logit, balance_loss, gate_reg_loss, sigma

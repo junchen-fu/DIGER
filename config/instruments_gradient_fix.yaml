@@ -1,36 +1,42 @@
-dataset: beauty
+dataset: instruments
 seed: 2020
 reproducibility: true
-log_dir: ./logs
+log_dir: ./logs/true_e2e_frqud
 
 map_path: .emb_map.json
-semantic_emb_path: Beauty.emb-llama.npy
+semantic_emb_path: Instruments.emb-llama.npy
 semantic_hidden_size: 4096
 code_num: 256
 code_length: 4
 
-epochs: 120
-lr_rec: 0.001
-weight_decay: 0.05
-
-joint_optimization: true
+training_mode: true_e2e_frqud
 end_to_end: true
-freeze_semantic_embedding: true
+joint_optimization: true
+assignment_forward: hard_st
+use_cached_sinkhorn_forward: true
+assignment_temperature: 2.0
+use_gumbel: true
+use_adaptive_selection: false
+use_learnable_sigma_gumbel: false
 use_indicator_ste: true
+freeze_semantic_embedding: true
+freeze_id_encoder: true
+freeze_rq: false
 freeze_id_epochs: 0
-lr_id: 0.00001
-gumbel_tau: 2.0
+evaluate_test_at_end: false
 
+epochs: 100
+lr_rec: 0.001
+lr_id: 0.00002
+weight_decay: 0.05
 code_loss_weight: 1.0
 recon_loss_weight: 1.0
 vq_loss_weight: 1.0
-qs_loss_weight: 0
-kl_loss_weight: 0.0
-dec_cl_loss_weight: 0.0
-qs_beta: 0.25
-
+qs_loss_weight: 0.0
+balance_loss_weight: 0.0
+gate_loss_weight: 0.0
 sim: cos
-alpha: 1
+alpha: 1.0
 tau: 0.07
 loss_type: mse
 
@@ -44,12 +50,11 @@ data_path: ./dataset
 lr_scheduler_type: cosine
 gradient_accumulation_steps: 1
 reference_effective_batch_size: 256
-preserve_reference_forward_batch: true
-sync_quantizer_stats: true
+preserve_reference_forward_batch: false
+sync_quantizer_stats: false
 
 max_his_len: 50
 early_stop: 15
-
 metrics: recall@1,recall@5,ndcg@5,recall@10,ndcg@10
 valid_metric: ndcg@10
 
@@ -65,8 +70,7 @@ activation_function: relu
 feed_forward_proj: relu
 num_beams: 20
 
-rqvae_path: ./rqvae_ckpt/beauty/best_collision_model.pth
-
+rqvae_path: ./rqvae_ckpt/instruments/best_collision_model.pth
 num_emb_list: [256, 256, 256]
 beta: 0.25
 e_dim: 256
@@ -79,7 +83,8 @@ dropout_prob: 0.0
 bn: false
 sk_epsilons: [0.003, 0.003, 0.003]
 sk_iters: 50
-
+gumbel_tau: 2.0
+use_tau_annealing: false
 use_gaq: false
-gaq_gamma: 0.6
-gaq_eps: 1e-7
+hot_threshold_ratio: 2.0
+usage_momentum: 0.99

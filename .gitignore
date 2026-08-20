@@ -26,4 +26,12 @@ logs/
 myckpt/
 reproduction_logs/
 
-# large release artifacts are tracked through Git LFS
+# large release artifacts stay external to the repository
+dataset/
+rqvae_ckpt/
+
+# local checkpoints and diagnostics produced by end-to-end experiments
+*.pt
+*.pth
+gradient_reports/
+debug_dumps/

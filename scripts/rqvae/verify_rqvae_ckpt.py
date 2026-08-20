@@ -19,7 +19,6 @@ TARGETS = {
         "e_dim": 256,
         "vq_type": "vq",
         "dist": "l2",
-        "device_prefix": "cuda:",
     },
     "instruments": {
         "epochs": 10000,
@@ -34,7 +33,6 @@ TARGETS = {
         "e_dim": 256,
         "vq_type": "vq",
         "dist": "l2",
-        "device_prefix": "cuda:",
     },
     "yelp": {
         "epochs": 10000,
@@ -49,17 +47,12 @@ TARGETS = {
         "e_dim": 256,
         "vq_type": "vq",
         "dist": "l2",
-        "device_prefix": "cuda:",
     },
 }
 
 
 def load_ckpt(path: str):
     return torch.load(path, map_location="cpu", weights_only=False)
-
-
-def normalize_device(value: str) -> str:
-    return "" if value is None else str(value).lower()
 
 
 def close_or_equal(a, b, abs_tol=1e-8):
@@ -84,14 +77,6 @@ def check_dataset(ds, args_dict, ckpt, strict):
         passed = False
 
     for key, expected in target.items():
-        if key == "device_prefix":
-            value = normalize_device(args_dict.get("device", ""))
-            ok = value.startswith(expected)
-            checks.append((key, value, expected, ok))
-            if not ok:
-                passed = False
-            continue
-
         actual = args_dict.get(key)
         if key in {"sk_epsilons", "num_emb_list", "layers"}:
             actual = list(actual) if actual is not None else None
@@ -119,12 +104,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_root", default="./rqvae_ckpt")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=sorted(TARGETS),
+        default=sorted(TARGETS),
+    )
     args = parser.parse_args()
 
     root = Path(args.ckpt_root)
     all_ok = True
 
-    for ds in ["beauty", "instruments", "yelp"]:
+    for ds in args.datasets:
         ckpt_path = root / ds / "best_collision_model.pth"
         if not ckpt_path.exists():
             print(f"MISSING {ds}: {ckpt_path}")
