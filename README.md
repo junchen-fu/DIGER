@@ -5,8 +5,9 @@
 > gradient was accidentally detached before reaching the RQ-VAE assignments and
 > codebooks. The corrected implementation is available on the
 > [`gradient-fix`](https://github.com/junchen-fu/DIGER/tree/gradient-fix)
-> branch, which is recommended for new experiments. The `main` branch remains
-> available for reproducing the historical paper implementation and results.
+> branch, which is the recommended starting point for new experiments and
+> further work based on DIGER. The `main` branch remains available for
+> reproducing the historical paper implementation and results.
 
 **SIGIR 2026 full paper.** DIGER learns differentiable semantic IDs for generative recommendation, allowing item identifiers to be optimized jointly with the recommendation model.
 
