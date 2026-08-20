@@ -98,12 +98,17 @@ python scripts/rqvae/verify_rqvae_ckpt.py
 
 ```bibtex
 @inproceedings{fu2026differentiable,
-  author = {Fu, Junchen and Ge, Xuri and Karatzoglou, Alexandros and Arapakis, Ioannis and Verberne, Suzan and Jose, Joemon M. and Ren, Zhaochun},
-  title = {Differentiable Semantic ID for Generative Recommendation},
-  year = {2026},
-  publisher = {Association for Computing Machinery},
-  doi = {10.1145/3805712.3809641},
-  booktitle = {Proceedings of the 49th International ACM SIGIR Conference on Research and Development in Information Retrieval},
-  pages = {369--379}
+author = {Fu, Junchen and Ge, Xuri and Karatzoglou, Alexandros and Arapakis, Ioannis and Verberne, Suzan and Jose, Joemon M. and Ren, Zhaochun},
+title = {Differentiable Semantic ID for Generative Recommendation},
+year = {2026},
+isbn = {9798400725999},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3805712.3809641},
+doi = {10.1145/3805712.3809641},
+booktitle = {Proceedings of the 49th International ACM SIGIR Conference on Research and Development in Information Retrieval},
+pages = {369–379},
+numpages = {11},
+series = {SIGIR '26}
 }
 ```
