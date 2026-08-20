@@ -11,6 +11,14 @@ forward pass and current soft assignments in the backward pass. Each run records
 its resolved configuration and manifest, selects the checkpoint on validation,
 and evaluates that checkpoint once on test.
 
+Gumbel noise is used during training to mitigate RQ-VAE codebook collapse by
+encouraging alternative code assignments. FrQUD adds this noise only to
+assignments whose EMA code usage is above the configured frequency threshold.
+The perturbation affects the current soft assignment in the backward path,
+while the forward semantic IDs remain cached hard Sinkhorn IDs. Gumbel noise is
+disabled for validation and test, which therefore use deterministic semantic
+IDs.
+
 Paper: [Differentiable Semantic ID for Generative Recommendation](https://arxiv.org/abs/2601.19711)
 
 ## Setup
