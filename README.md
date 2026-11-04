@@ -35,10 +35,7 @@ This repository contains the code, processed data, semantic embeddings, and RQ-V
 The released scripts cover all three datasets used in the table: Beauty, Instruments, and Yelp.
 
 > [!Important]
-> We released a patch for a corrected implementation of the gradient path, which is available on the
-> [`gradient-fix`](https://github.com/junchen-fu/DIGER/tree/gradient-fix)
-> branch, which is the recommended starting point for new experiments and
-> further work based on DIGER. 
+We have released a patch correcting the gradient path implementation, available on the [`gradient-fix`](https://github.com/junchen-fu/DIGER/tree/gradient-fix) branch. We recommend using this branch as the starting point for new experiments and future work building on DIGER.
 
 
 ## Release Artifacts
