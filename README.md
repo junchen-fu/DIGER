@@ -1,14 +1,5 @@
 # DIGER: Differentiable Semantic ID for Generative Recommendation
 
-> [!IMPORTANT]
-> In the original paper-reproduction path on `main`, the recommendation-loss
-> gradient was accidentally detached before reaching the RQ-VAE assignments and
-> codebooks. The corrected implementation is available on the
-> [`gradient-fix`](https://github.com/junchen-fu/DIGER/tree/gradient-fix)
-> branch, which is the recommended starting point for new experiments and
-> further work based on DIGER. The `main` branch remains available for
-> reproducing the historical paper implementation and results.
-
 **SIGIR 2026 full paper.** DIGER learns differentiable semantic IDs for generative recommendation, allowing item identifiers to be optimized jointly with the recommendation model.
 
 ![SID](https://img.shields.io/badge/Task-SID-red)
@@ -42,6 +33,13 @@ This repository contains the code, processed data, semantic embeddings, and RQ-V
 - **SDUD+FrqUD**: the combined setting.
 
 The released scripts cover all three datasets used in the table: Beauty, Instruments, and Yelp.
+
+> [!Important]
+> We released a patch for a corrected implementation of the gradient path, which is available on the
+> [`gradient-fix`](https://github.com/junchen-fu/DIGER/tree/gradient-fix)
+> branch, which is the recommended starting point for new experiments and
+> further work based on DIGER. 
+
 
 ## Release Artifacts
 
